@@ -2,10 +2,9 @@ allowed_syscalls:
   - git.clone
   - sast.scan
   - lint
-  - deploy.service
 
 denied_syscalls:
-  - "retest"
+  - deploy.service
 budget_limits:
   max_per_process: 100
 

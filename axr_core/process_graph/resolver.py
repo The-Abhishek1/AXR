@@ -18,9 +18,9 @@ class ProcessGraphResolver:
         # Map step_id -> step for fast lookup
         self.steps: Dict[UUID, ProcessStep] = {step.step_id: step for step in steps}
         
-        # ------------------------
-        # Public API
-        # ------------------------
+    # ------------------------
+    # Public API
+    # ------------------------
         
     def resolve(self) -> List[ProcessStep]:
         runnable: List[ProcessStep] = []

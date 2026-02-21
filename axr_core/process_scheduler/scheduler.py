@@ -13,6 +13,9 @@ from axr_core.security_module.evaluator import SecurityEvaluator
 from axr_core.capabilities.issuer import CapabilityIssuer
 from axr_core.capabilities.validator import CapabilityValidator
 from axr_core.syscalls.exec_handler import ExecHandler
+from axr_core.process_memory.memory_manager import ProcessMemoryManager
+from axr_core.transactions.transaction_manager import TransactionManager
+from axr_core.checkpointing.checkpoint_manager import CheckpointManager
 
 class ProcessScheduler:
     """
@@ -41,6 +44,9 @@ class ProcessScheduler:
         
         self.capability_issuer = CapabilityIssuer()
         self.exec_handler = ExecHandler()
+        self.memory_manager = ProcessMemoryManager()
+        self.transaction_manager = TransactionManager(self.memory_manager)
+        self.checkpoint_manager = CheckpointManager(self.memory_manager)
 
     # ---------------------------
     # Kernel registration methods
@@ -86,7 +92,7 @@ class ProcessScheduler:
             steps = self.steps.get(process.pid, [])
             resolver = ProcessGraphResolver(steps)
             runnable_steps = resolver.resolve()
-            print(f"[RESOLVE] Runnable steps: {[s.syscall for s in runnable_steps]}")
+            print(f"\n[RESOLVE] Runnable steps: {[s.syscall for s in runnable_steps]}")
 
             for step in runnable_steps:
                 if step.status == StepStatus.READY:
@@ -112,27 +118,45 @@ class ProcessScheduler:
 
     def _execute_step(self, process: AIProcess, step: ProcessStep) -> None:
         try:
-            print(f"[EXEC] PID={process.pid} STEP={step.syscall}")
+            print(f"[EXEC] PID= {process.pid} STEP= {step.syscall}")
 
             # Charge budget first
             process.charge_budget(step.cost_estimate)
 
             # Execute via kernel syscall handler
-            result = self.exec_handler.run(process, step)
+            result = self.exec_handler.run(process, step, self.memory_manager)
+            
+            # Write output to process memory
+            self.memory_manager.write_output(process.pid, step.step_id, result)
 
-            print(f"[DONE] STEP={step.syscall} RESULT={result}")
+            print(f"[DONE] STEP= {step.syscall} RESULT= {result}")
 
             step.succeed()
+            
+            self.checkpoint_manager.save_checkpoint(
+                process, self.steps[process.pid]
+            )
 
         except PermissionError as e:
             step.fail(str(e))
             process.fail("Security violation")
-            print(f"[DENY] STEP={step.syscall}")
+            
+            print(f"[DENY] STEP= {step.syscall}")
+            
+            self.transaction_manager.rollback_process(
+                process, self.steps[process.pid]
+            )
+            
 
         except Exception as e:
             step.fail(str(e))
             process.fail(str(e))
-            print(f"[FAIL] STEP={step.syscall} ERROR={e}")
+            
+            print(f"[FAIL] STEP= {step.syscall} ERROR= {e}")
+            
+            self.transaction_manager.rollback_process(
+                process, self.steps[process.pid]
+            )
 
     # ---------------------------
     # Process completion check
@@ -159,7 +183,17 @@ class ProcessScheduler:
                 elif any_failed and process.state != ProcessState.FAILED:
                     process.fail("One or more steps failed")
                     
-
+    def resume_process(self, process: AIProcess):
+        print(f"[RESUME] Restoring process {process.pid}")
+        
+        steps = self.steps.get(process.pid)
+        if not steps:
+            return
+        
+        self.checkpoint_manager.restore_checkpoint(process, steps)
+        
+        process.state =  ProcessState.RUNNING
+    
     def run_once(self) -> None:
         """
         Run ad single scheduling cycle (for testing).

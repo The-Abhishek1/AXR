@@ -14,7 +14,7 @@ class BaseHandler:
         self.validator = CapabilityValidator()
         self.registry = ToolRegistry()
 
-    def execute_tool(self, process, step, capability):
+    def execute_tool(self, process, step, capability, memory_manager=None):
         # 🔐 Validate capability
         if not self.validator.validate(capability):
             raise PermissionError("Invalid or expired capability")
@@ -23,4 +23,4 @@ class BaseHandler:
         tool = self.registry.get_tool(step.syscall)
 
         # 🚀 Execute tool
-        return tool.execute(process, step)
+        return tool.execute(process, step, memory_manager)
