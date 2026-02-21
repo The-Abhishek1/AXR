@@ -23,29 +23,30 @@ class ProcessGraphResolver:
         # ------------------------
         
     def resolve(self) -> List[ProcessStep]:
-        """
-        updates step states and returns list of READY steps.
-        """
         runnable: List[ProcessStep] = []
-        
+
         for step in self.steps.values():
+
+            # Skip finished steps
             if step.status in {StepStatus.SUCCESS, StepStatus.RUNNING, StepStatus.SKIPPED}:
                 continue
-            
-            if step.status == StepStatus.FAILED:
-                self._propogate_failure(step)
-                continue
-            
+
+            # If any dependency failed → skip this step
             if self._dependencies_failed(step):
-                self.skip()
+                step.skip()
                 continue
-            
-            if self._dependencies_satisfied(step):
-                if step.status == StepStatus.PENDING and self._dependencies_satisfied(step):
-                    step.mark_ready()
-                if step.status == StepStatus.READY:
-                    runnable.append(step)
-        
+
+            # Root step (no dependencies) → READY
+            if not step.depends_on and step.status == StepStatus.PENDING:
+                step.mark_ready()
+
+            # Dependencies satisfied → READY
+            elif self._dependencies_satisfied(step) and step.status == StepStatus.PENDING:
+                step.mark_ready()
+
+            if step.status == StepStatus.READY:
+                runnable.append(step)
+
         return runnable
     
     # -------------------------

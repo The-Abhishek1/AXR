@@ -97,6 +97,10 @@ class AIProcess:
         self.last_scheduled_at = datetime.utcnow()
     
     def is_active(self) -> bool:
-        self.state in {ProcessState.READY, ProcessState.RUNNING, ProcessState.BLOCKED}
+        return self.state in {
+            ProcessState.READY,
+            ProcessState.RUNNING,
+            ProcessState.BLOCKED,
+        }
 
         

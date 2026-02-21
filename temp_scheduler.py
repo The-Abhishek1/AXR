@@ -12,12 +12,15 @@ process = AIProcess(intent="secure repo", budget_limit=100)
 step1 = ProcessStep(pid=process.pid, syscall="git.clone", cost_estimate=5)
 step2 = ProcessStep(pid=process.pid, syscall="sast.scan", depends_on=[step1.step_id], cost_estimate=10)
 step3 = ProcessStep(pid=process.pid, syscall="lint", depends_on=[step1.step_id], cost_estimate=3)
-step4 = ProcessStep(pid=process.pid, syscall="deploy.service")
+deploy = ProcessStep(pid=process.pid, syscall="deploy.service", depends_on=[step2.step_id, step3.step_id] )
 
-steps = [step1, step2, step3, step4]
+steps = [step1, step2, step3,deploy]
 
 scheduler = ProcessScheduler(max_workers=2)
 scheduler.register_process(process, steps)
+
+print("Process state before loop:", process.state)
+print("is_active:", process.is_active())
 
 while process.is_active():
     scheduler.run_once()

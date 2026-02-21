@@ -75,6 +75,7 @@ class ProcessScheduler:
             steps = self.steps.get(process.pid, [])
             resolver = ProcessGraphResolver(steps)
             runnable_steps = resolver.resolve()
+            print(f"[RESOLVE] Runnable steps: {[s.syscall for s in runnable_steps]}")
 
             for step in runnable_steps:
                 if step.status == StepStatus.READY:
@@ -159,3 +160,9 @@ class ProcessScheduler:
         if step.syscall == "deploy.service":
             return False
         return True
+
+    def run_once(self) -> None:
+        """
+        Run ad single scheduling cycle (for testing).
+        """
+        self._schedule_cycle()
