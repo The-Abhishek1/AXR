@@ -14,6 +14,8 @@ step2 = ProcessStep(pid=process.pid, syscall="sast.scan", depends_on=[step1.step
 step3 = ProcessStep(pid=process.pid, syscall="lint", depends_on=[step1.step_id], cost_estimate=3)
 deploy = ProcessStep(pid=process.pid, syscall="deploy.service", depends_on=[step2.step_id, step3.step_id] )
 
+step2.failure_policy = "retry"
+step2.max_retries = 3
 steps = [step1, step2, step3,deploy]
 
 scheduler = ProcessScheduler(max_workers=2)

@@ -12,6 +12,7 @@ class StepStatus(str, Enum):
     SUCCESS = "SUCCESS"
     FAILED = "FAILED"
     SKIPPED = "SKIPPED"
+    ROLLED_BACK = "ROLLED_BACK"
     
 @dataclass
 class ProcessStep:
@@ -34,8 +35,11 @@ class ProcessStep:
     
     # Runtime metadata
     retries: int = 0
-    max_retries: int = 0
+    max_retries: int = 2
     last_error: Optional[str] = None
+    backoff_seconds: int = 1
+    failure_policy: str = "fail_process"
+    # Options: fail_process | retry | skip
     
     # Input/Output references (for memory manager later)
     input_ref: Optional[str] = None

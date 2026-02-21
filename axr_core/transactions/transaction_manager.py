@@ -3,15 +3,17 @@ from typing import List
 from tool_registry.registry import ToolRegistry
 from axr_core.process_memory.memory_manager import ProcessMemoryManager
 from axr_core.process_graph.models import ProcessStep, StepStatus
+from axr_core.events.event import Event
 
 class TransactionManager:
     """
     Handles rollback of completed steps on process failure.
     """
     
-    def __init__(self, memory_manager: ProcessMemoryManager):
+    def __init__(self, memory_manager: ProcessMemoryManager, event_bus):
         self.registry = ToolRegistry()
         self.memory_manager = memory_manager
+        self.event_bus = event_bus
     
     # ----------------------------
     # Rollback process
@@ -37,6 +39,16 @@ class TransactionManager:
                 print(f"\n[TXN] Rolling back {step.syscall}")
                 
                 tool.rollback(process, step, self.memory_manager)
+                
+                step.status = StepStatus.ROLLED_BACK
+                
+                self.event_bus.publish(
+                    Event(
+                        event_type="STEP_ROLLED_BACK",
+                        pid=process.pid,
+                        step_id=step.step_id,
+                    )
+                )
                 
                 # Clean memory for that step
                 self.memory_manager.write_output(process.pid, step.step_id, None)

@@ -16,6 +16,9 @@ from axr_core.syscalls.exec_handler import ExecHandler
 from axr_core.process_memory.memory_manager import ProcessMemoryManager
 from axr_core.transactions.transaction_manager import TransactionManager
 from axr_core.checkpointing.checkpoint_manager import CheckpointManager
+from axr_core.retry.retry_manager import RetryManager
+from axr_core.events.event_bus import EventBus
+from axr_core.events.event import Event
 
 class ProcessScheduler:
     """
@@ -45,8 +48,10 @@ class ProcessScheduler:
         self.capability_issuer = CapabilityIssuer()
         self.exec_handler = ExecHandler()
         self.memory_manager = ProcessMemoryManager()
-        self.transaction_manager = TransactionManager(self.memory_manager)
+        self.event_bus = EventBus()
+        self.transaction_manager = TransactionManager(self.memory_manager, self.event_bus)
         self.checkpoint_manager = CheckpointManager(self.memory_manager)
+        self.retry_manager = RetryManager()
 
     # ---------------------------
     # Kernel registration methods
@@ -89,6 +94,10 @@ class ProcessScheduler:
             if process.state == ProcessState.READY:
                 process.start()
 
+                self.event_bus.publish(
+                    Event(event_type="PROCESS_STARTED", pid=process.pid)
+                )
+
             steps = self.steps.get(process.pid, [])
             resolver = ProcessGraphResolver(steps)
             runnable_steps = resolver.resolve()
@@ -97,6 +106,14 @@ class ProcessScheduler:
             for step in runnable_steps:
                 if step.status == StepStatus.READY:
                     print(f"[READY] {step.syscall}")
+                    self.event_bus.publish(
+                        Event(
+                            event_type="STEP_READY",
+                            pid=process.pid,
+                            step_id=step.step_id,
+                            metadata={"syscall": step.syscall},
+                        )
+                    )
                     step.start()
                     process.current_step_id = step.step_id
                     process.mark_scheduled()
@@ -117,6 +134,15 @@ class ProcessScheduler:
     # ---------------------------
 
     def _execute_step(self, process: AIProcess, step: ProcessStep) -> None:
+        
+        self.event_bus.publish(
+            Event(
+                event_type="STEP_STARTED",
+                pid=process.pid,
+                step_id=step.step_id,
+                metadata={"syscall": step.syscall},
+            )
+        )
         try:
             print(f"[EXEC] PID= {process.pid} STEP= {step.syscall}")
 
@@ -133,31 +159,101 @@ class ProcessScheduler:
 
             step.succeed()
             
+            self.event_bus.publish(
+                Event(
+                    event_type="STEP_SUCCEEDED",
+                    pid=process.pid,
+                    step_id=step.step_id,
+                )
+            )
+            
             self.checkpoint_manager.save_checkpoint(
                 process, self.steps[process.pid]
             )
 
         except PermissionError as e:
             step.fail(str(e))
+
+            if step.failure_policy == "retry" and self.retry_manager.should_retry(step):
+                self.retry_manager.apply_backoff(step)
+                self.retry_manager.mark_retry(step, str(e))
+                print(f"[RETRY] Retrying {step.syscall}")
+                self.event_bus.publish(
+                    Event(
+                        event_type="STEP_RETRIED",
+                        pid=process.pid,
+                        step_id=step.step_id,
+                        metadata={"attempt": step.retries},
+                    )
+                )
+                return
+
+            if step.failure_policy == "skip":
+                step.status = StepStatus.SKIPPED
+                print(f"[SKIP] {step.syscall} skipped")
+                self.event_bus.publish(
+                    Event(
+                        event_type="STEP_SKIPPED",
+                        pid=process.pid,
+                        step_id=step.step_id,
+                        metadata={"attempt": step.retries},
+                    )
+                )
+                return
+
             process.fail("Security violation")
-            
-            print(f"[DENY] STEP= {step.syscall}")
-            
-            self.transaction_manager.rollback_process(
-                process, self.steps[process.pid]
+            print(f"[DENY] STEP={step.syscall}")
+            self.event_bus.publish(
+                Event(
+                    event_type="STEP_FAILED",
+                    pid=process.pid,
+                    step_id=step.step_id,
+                    metadata={"error": str(e)},
+                )
             )
-            
+            self.transaction_manager.rollback_process(process, self.steps[process.pid])
 
         except Exception as e:
             step.fail(str(e))
-            process.fail(str(e))
-            
-            print(f"[FAIL] STEP= {step.syscall} ERROR= {e}")
-            
-            self.transaction_manager.rollback_process(
-                process, self.steps[process.pid]
-            )
 
+            if step.failure_policy == "retry" and self.retry_manager.should_retry(step):
+                self.retry_manager.apply_backoff(step)
+                self.retry_manager.mark_retry(step, str(e))
+                print(f"[RETRY] Retrying {step.syscall}")
+                self.event_bus.publish(
+                    Event(
+                        event_type="STEP_RETRIED",
+                        pid=process.pid,
+                        step_id=step.step_id,
+                        metadata={"attempt": step.retries},
+                    )
+                )
+                return
+
+            if step.failure_policy == "skip":
+                step.status = StepStatus.SKIPPED
+                print(f"[SKIP] {step.syscall} skipped")
+                self.event_bus.publish(
+                    Event(
+                        event_type="STEP_SKIPPED",
+                        pid=process.pid,
+                        step_id=step.step_id,
+                        metadata={"attempt": step.retries},
+                    )
+                )
+                return
+
+            process.fail(str(e))
+            self.event_bus.publish(
+                Event(
+                    event_type="STEP_FAILED",
+                    pid=process.pid,
+                    step_id=step.step_id,
+                    metadata={"error": str(e)},
+                )
+            )
+            print(f"[FAIL] STEP={step.syscall} ERROR={e}")
+            self.transaction_manager.rollback_process(process, self.steps[process.pid])
     # ---------------------------
     # Process completion check
     # ---------------------------
@@ -178,9 +274,21 @@ class ProcessScheduler:
                 any_failed = any(step.status == StepStatus.FAILED for step in steps)
 
                 if all_done:
+                    self.event_bus.publish(
+                        Event(
+                            event_type="PROCESS_SUCCEEDED",
+                            pid=process.pid,
+                        )
+                    )
                     process.terminate()
 
                 elif any_failed and process.state != ProcessState.FAILED:
+                    self.event_bus.publish(
+                        Event(
+                            event_type="PROCESS_FAILED",
+                            pid=process.pid,
+                        )
+                    )
                     process.fail("One or more steps failed")
                     
     def resume_process(self, process: AIProcess):
