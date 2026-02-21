@@ -12,6 +12,7 @@ from axr_core.process_graph.resolver import ProcessGraphResolver
 from axr_core.security_module.evaluator import SecurityEvaluator
 from axr_core.capabilities.issuer import CapabilityIssuer
 from axr_core.capabilities.validator import CapabilityValidator
+from axr_core.syscalls.exec_handler import ExecHandler
 
 class ProcessScheduler:
     """
@@ -39,6 +40,7 @@ class ProcessScheduler:
         )
         
         self.capability_issuer = CapabilityIssuer()
+        self.exec_handler = ExecHandler()
 
     # ---------------------------
     # Kernel registration methods
@@ -110,46 +112,27 @@ class ProcessScheduler:
 
     def _execute_step(self, process: AIProcess, step: ProcessStep) -> None:
         try:
-            if not self.security_evaluator.allow(process, step):
-                step.fail("Policy denied")
-                process.fail("Security violation")
-                print(f"[DENY] STEP= {step.syscall}")
-                return
-            
-            capability = self.capability_issuer.issue(
-                pid=process.pid,
-                step_id=step.step_id,
-                syscall=step.syscall,
-                budget_limit=process.remaining_budget(),
-            )
-            
-            print(f"[CAP] Issued capability for {step.syscall}")
-            
-            validator = CapabilityValidator()
-            
-            if not validator.validate(capability):
-                step.fail("Invalid capability")
-                process.fail("Capability validation failed")
-                print(f"[CAP-INVALID] STEP= {step.syscall}")
-                return
-            
-                            
-            print(f"[EXEC] PID= {process.pid} STEP={step.syscall}")
-            # Simulate cost charge
+            print(f"[EXEC] PID={process.pid} STEP={step.syscall}")
+
+            # Charge budget first
             process.charge_budget(step.cost_estimate)
 
-            # Simulated syscall execution (replace with real handler later)
-            time.sleep(0.5)
+            # Execute via kernel syscall handler
+            result = self.exec_handler.run(process, step)
 
-            # Simulate success
+            print(f"[DONE] STEP={step.syscall} RESULT={result}")
+
             step.succeed()
-            print(f"[DONE] STEP= {step.syscall}")
 
+        except PermissionError as e:
+            step.fail(str(e))
+            process.fail("Security violation")
+            print(f"[DENY] STEP={step.syscall}")
 
         except Exception as e:
             step.fail(str(e))
             process.fail(str(e))
-            print(f"[FAIL] STEP= {step.syscall} ERROR={e}")
+            print(f"[FAIL] STEP={step.syscall} ERROR={e}")
 
     # ---------------------------
     # Process completion check
