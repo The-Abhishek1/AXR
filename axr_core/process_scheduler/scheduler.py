@@ -9,7 +9,9 @@ from uuid import UUID
 from axr_core.process_manager.process import AIProcess, ProcessState
 from axr_core.process_graph.models import ProcessStep, StepStatus
 from axr_core.process_graph.resolver import ProcessGraphResolver
-
+from axr_core.security_module.evaluator import SecurityEvaluator
+from axr_core.capabilities.issuer import CapabilityIssuer
+from axr_core.capabilities.validator import CapabilityValidator
 
 class ProcessScheduler:
     """
@@ -30,6 +32,13 @@ class ProcessScheduler:
 
         self._lock = threading.Lock()
         self._running = False
+        
+        # Initilize security module
+        self.security_evaluator = SecurityEvaluator(
+            policy_path="policies/devsecops_safe.yaml"
+        )
+        
+        self.capability_issuer = CapabilityIssuer()
 
     # ---------------------------
     # Kernel registration methods
@@ -67,7 +76,7 @@ class ProcessScheduler:
         futures = []
 
         for process in active_processes:
-            print(f"[SCHED] Checking process {process.pid} state={process.state}")
+            print(f"[SCHED] Checking process {process.pid} state= {process.state}")
             
             if process.state == ProcessState.READY:
                 process.start()
@@ -101,13 +110,31 @@ class ProcessScheduler:
 
     def _execute_step(self, process: AIProcess, step: ProcessStep) -> None:
         try:
-            if not self._security_allow(process, step):
+            if not self.security_evaluator.allow(process, step):
                 step.fail("Policy denied")
                 process.fail("Security violation")
-                print(f"[DENY] STEP={step.syscall}")
+                print(f"[DENY] STEP= {step.syscall}")
                 return
-                
-            print(f"[EXEC] PID={process.pid} STEP={step.syscall}")
+            
+            capability = self.capability_issuer.issue(
+                pid=process.pid,
+                step_id=step.step_id,
+                syscall=step.syscall,
+                budget_limit=process.remaining_budget(),
+            )
+            
+            print(f"[CAP] Issued capability for {step.syscall}")
+            
+            validator = CapabilityValidator()
+            
+            if not validator.validate(capability):
+                step.fail("Invalid capability")
+                process.fail("Capability validation failed")
+                print(f"[CAP-INVALID] STEP= {step.syscall}")
+                return
+            
+                            
+            print(f"[EXEC] PID= {process.pid} STEP={step.syscall}")
             # Simulate cost charge
             process.charge_budget(step.cost_estimate)
 
@@ -116,13 +143,13 @@ class ProcessScheduler:
 
             # Simulate success
             step.succeed()
-            print(f"[DONE] STEP={step.syscall}")
+            print(f"[DONE] STEP= {step.syscall}")
 
 
         except Exception as e:
             step.fail(str(e))
             process.fail(str(e))
-            print(f"[FAIL] STEP={step.syscall} ERROR={e}")
+            print(f"[FAIL] STEP= {step.syscall} ERROR={e}")
 
     # ---------------------------
     # Process completion check
@@ -149,17 +176,6 @@ class ProcessScheduler:
                 elif any_failed and process.state != ProcessState.FAILED:
                     process.fail("One or more steps failed")
                     
-    
-    
-    def _security_allow(self, process: AIProcess, step: ProcessStep) -> bool:
-        """
-        Temporary security stub.
-        Later this will call security_module.evaluator.
-        """
-        # Example rule: block 'deploy.service'
-        if step.syscall == "deploy.service":
-            return False
-        return True
 
     def run_once(self) -> None:
         """
