@@ -19,6 +19,9 @@ from axr_core.checkpointing.checkpoint_manager import CheckpointManager
 from axr_core.retry.retry_manager import RetryManager
 from axr_core.events.event_bus import EventBus
 from axr_core.events.event import Event
+from axr_core.resource_manager.resource_manager import ResourceManager
+from axr_core.resource_manager.resource_model import ProcessResources
+
 
 class ProcessScheduler:
     """
@@ -52,6 +55,7 @@ class ProcessScheduler:
         self.transaction_manager = TransactionManager(self.memory_manager, self.event_bus)
         self.checkpoint_manager = CheckpointManager(self.memory_manager)
         self.retry_manager = RetryManager()
+        self.resource_manager = ResourceManager()
 
     # ---------------------------
     # Kernel registration methods
@@ -61,6 +65,10 @@ class ProcessScheduler:
         with self._lock:
             self.processes[process.pid] = process
             self.steps[process.pid] = steps
+            self.resource_manager.register_process(
+                process.pid,
+                ProcessResources(max_concurrent_steps=2, max_budget=process.budget_limit),
+            )
 
     # ---------------------------
     # Kernel loop control
@@ -104,23 +112,39 @@ class ProcessScheduler:
             print(f"\n[RESOLVE] Runnable steps: {[s.syscall for s in runnable_steps]}")
 
             for step in runnable_steps:
-                if step.status == StepStatus.READY:
-                    print(f"[READY] {step.syscall}")
-                    self.event_bus.publish(
-                        Event(
-                            event_type="STEP_READY",
-                            pid=process.pid,
-                            step_id=step.step_id,
-                            metadata={"syscall": step.syscall},
-                        )
+                if step.status != StepStatus.READY:
+                    continue
+                
+                # Resource admission control
+                if not self.resource_manager.can_schedule(
+                    process.pid,
+                    step.cost_estimate,
+                    process.remaining_budget(),
+                ):
+                    print(f"[RESOURCE] Blocked {step.syscall} (no slots/budge)")
+                    continue
+                
+                print(f"[READY] {step.syscall}")
+                
+                self.event_bus.publish(
+                    Event(
+                        event_type="STEP_READY",
+                        pid=process.pid,
+                        step_id=step.step_id,
+                        metadata={"syscall": step.syscall},
                     )
-                    step.start()
-                    process.current_step_id = step.step_id
-                    process.mark_scheduled()
-
-                    futures.append(
-                        self.executor.submit(self._execute_step, process, step)
-                    )
+                )
+                
+                step.start()
+                process.current_step_id = step.step_id
+                process.mark_scheduled()
+                
+                # Allocate resource slot
+                self.resource_manager.allocate(process.pid)
+                
+                futures.append(
+                    self.executor.submit(self._execute_step, process, step)
+                )
 
         # Wait for step execution to complete
         for future in as_completed(futures):
@@ -170,6 +194,7 @@ class ProcessScheduler:
             self.checkpoint_manager.save_checkpoint(
                 process, self.steps[process.pid]
             )
+            self.resource_manager.release(process.pid)
 
         except PermissionError as e:
             step.fail(str(e))
@@ -212,6 +237,7 @@ class ProcessScheduler:
                 )
             )
             self.transaction_manager.rollback_process(process, self.steps[process.pid])
+            self.resource_manager.release(process.pid)
 
         except Exception as e:
             step.fail(str(e))
@@ -254,6 +280,10 @@ class ProcessScheduler:
             )
             print(f"[FAIL] STEP={step.syscall} ERROR={e}")
             self.transaction_manager.rollback_process(process, self.steps[process.pid])
+            self.resource_manager.release(process.pid)
+    
+        finally:
+            self.resource_manager.release(process.pid)
     # ---------------------------
     # Process completion check
     # ---------------------------
