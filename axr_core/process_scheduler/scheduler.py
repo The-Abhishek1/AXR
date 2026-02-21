@@ -67,7 +67,7 @@ class ProcessScheduler:
             self.steps[process.pid] = steps
             self.resource_manager.register_process(
                 process.pid,
-                ProcessResources(max_concurrent_steps=2, max_budget=process.budget_limit),
+                ProcessResources(max_concurrent_steps=1, max_budget=process.budget_limit),
             )
 
     # ---------------------------
@@ -121,7 +121,7 @@ class ProcessScheduler:
                     step.cost_estimate,
                     process.remaining_budget(),
                 ):
-                    print(f"[RESOURCE] Blocked {step.syscall} (no slots/budge)")
+                    print(f"[RESOURCE] Blocked {step.syscall} (no slots/budget)")
                     continue
                 
                 print(f"[READY] {step.syscall}")

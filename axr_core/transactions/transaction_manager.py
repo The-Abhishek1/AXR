@@ -24,7 +24,7 @@ class TransactionManager:
         Rollback all SUCCESS steps in reverse order.
         """
         
-        print(f"[TXN] Starting rollback for PID= {process.pid}")
+        print(f"\n[TXN] Starting rollback for PID= {process.pid}")
         
         successful_steps = [
             step for step in steps if step.status == StepStatus.SUCCESS
