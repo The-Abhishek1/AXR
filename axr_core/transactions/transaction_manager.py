@@ -4,6 +4,7 @@ from tool_registry.registry import ToolRegistry
 from axr_core.process_memory.memory_manager import ProcessMemoryManager
 from axr_core.process_graph.models import ProcessStep, StepStatus
 from axr_core.events.event import Event
+from axr_core.persistence.repository import PersistenceRepository
 
 class TransactionManager:
     """
@@ -14,6 +15,7 @@ class TransactionManager:
         self.registry = ToolRegistry()
         self.memory_manager = memory_manager
         self.event_bus = event_bus
+        self.repo = PersistenceRepository()
     
     # ----------------------------
     # Rollback process
@@ -41,6 +43,8 @@ class TransactionManager:
                 tool.rollback(process, step, self.memory_manager)
                 
                 step.status = StepStatus.ROLLED_BACK
+                
+                self.repo.save_step(step)
                 
                 self.event_bus.publish(
                     Event(

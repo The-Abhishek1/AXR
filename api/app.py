@@ -6,6 +6,9 @@ from axr_core.process_scheduler.scheduler import ProcessScheduler
 
 from api.routes import tasks, tools, policies, replay
 
+from api.deps.db import engine
+from axr_core.persistence.models import Base
+
 app = FastAPI()
 
 # Single scheduler instance
@@ -21,6 +24,8 @@ def scheduler_loop():
         
 @app.on_event("startup")
 def start_scheduler():
+    Base.metadata.create_all(bind=engine)
+    
     thread = threading.Thread(target=scheduler_loop, daemon=True)
     thread.start()
 

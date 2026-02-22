@@ -21,7 +21,7 @@ from axr_core.events.event_bus import EventBus
 from axr_core.events.event import Event
 from axr_core.resource_manager.resource_manager import ResourceManager
 from axr_core.resource_manager.resource_model import ProcessResources
-
+from axr_core.persistence.repository import PersistenceRepository
 
 class ProcessScheduler:
     """
@@ -51,11 +51,13 @@ class ProcessScheduler:
         self.capability_issuer = CapabilityIssuer()
         self.exec_handler = ExecHandler()
         self.memory_manager = ProcessMemoryManager()
-        self.event_bus = EventBus()
+        self.repo = PersistenceRepository()
+        self.event_bus = EventBus(repo=self.repo)
         self.transaction_manager = TransactionManager(self.memory_manager, self.event_bus)
         self.checkpoint_manager = CheckpointManager(self.memory_manager)
         self.retry_manager = RetryManager()
         self.resource_manager = ResourceManager()
+        
 
     # ---------------------------
     # Kernel registration methods
@@ -69,6 +71,11 @@ class ProcessScheduler:
                 process.pid,
                 ProcessResources(max_concurrent_steps=1, max_budget=process.budget_limit),
             )
+            
+            self.repo.save_process(process)
+            
+            for step in steps:
+                self.repo.save_step(step)
 
     # ---------------------------
     # Kernel loop control
@@ -183,6 +190,9 @@ class ProcessScheduler:
 
             step.succeed()
             
+            self.repo.save_step(step)
+            self.repo.save_process(process)
+            
             self.event_bus.publish(
                 Event(
                     event_type="STEP_SUCCEEDED",
@@ -198,6 +208,8 @@ class ProcessScheduler:
 
         except PermissionError as e:
             step.fail(str(e))
+            self.repo.save_step(step)
+            self.repo.save_process(process)
 
             if step.failure_policy == "retry" and self.retry_manager.should_retry(step):
                 self.retry_manager.apply_backoff(step)
@@ -241,6 +253,8 @@ class ProcessScheduler:
 
         except Exception as e:
             step.fail(str(e))
+            self.repo.save_step(step)
+            self.repo.save_process(process)
 
             if step.failure_policy == "retry" and self.retry_manager.should_retry(step):
                 self.retry_manager.apply_backoff(step)
