@@ -23,8 +23,11 @@ def scheduler_loop():
         time.sleep(0.2)
         
 @app.on_event("startup")
-def start_scheduler():
+async def start_scheduler():
     Base.metadata.create_all(bind=engine)
+    
+    # init NATS for scheduler
+    await scheduler.init_nats()
     
     thread = threading.Thread(target=scheduler_loop, daemon=True)
     thread.start()

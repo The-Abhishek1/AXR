@@ -3,10 +3,17 @@ from tool_runtime.base_tool.tool import BaseTool
 
 
 class SASTTool(BaseTool):
-    def execute(self, process, step, memory_manager=None):
+    def execute(self, process, inputs, memory_manager=None):
         print(f"[TOOL] sast.scan executing for PID= {process.pid}")
         
-        previous_outputs = memory_manager.read_process_memory(process.pid)
+        if inputs:
+            previous_outputs = inputs
+        
+        elif memory_manager:
+            previous_outputs = memory_manager.read_process_memory(process.pid)
+        else:
+            previous_outputs = {}
+        
         
         print(f"[MEMORY] Available inputs: {previous_outputs}")
         time.sleep(0.5)

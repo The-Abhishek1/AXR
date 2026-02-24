@@ -1,0 +1,25 @@
+            # Execute via kernel syscall handler
+            result = self.exec_handler.run(process, step, self.memory_manager)
+            
+            # Write output to process memory
+            self.memory_manager.write_output(process.pid, step.step_id, result)
+
+            print(f"[DONE] STEP= {step.syscall} RESULT= {result}")
+
+            step.succeed()
+            
+            self.repo.save_step(step)
+            self.repo.save_process(process)
+            
+            self.event_bus.publish(
+                Event(
+                    event_type="STEP_SUCCEEDED",
+                    pid=process.pid,
+                    step_id=step.step_id,
+                )
+            )
+            
+            self.checkpoint_manager.save_checkpoint(
+                process, self.steps[process.pid]
+            )
+            self.resource_manager.release(process.pid)

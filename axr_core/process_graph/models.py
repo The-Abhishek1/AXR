@@ -44,6 +44,7 @@ class ProcessStep:
     # Input/Output references (for memory manager later)
     input_ref: Optional[str] = None
     output_ref: Optional[str] = None
+    finalized: bool = False
     
     # -------------------------------
     # State transitions

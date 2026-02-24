@@ -22,6 +22,11 @@ from axr_core.events.event import Event
 from axr_core.resource_manager.resource_manager import ResourceManager
 from axr_core.resource_manager.resource_model import ProcessResources
 from axr_core.persistence.repository import PersistenceRepository
+from axr_core.distributed.nats_client import NATSClient
+from axr_core.distributed.message import task_message
+from axr_core.reliability.lease_manager import LeaseManager
+import asyncio
+
 
 class ProcessScheduler:
     """
@@ -57,8 +62,21 @@ class ProcessScheduler:
         self.checkpoint_manager = CheckpointManager(self.memory_manager)
         self.retry_manager = RetryManager()
         self.resource_manager = ResourceManager()
+        self.lease_manager = LeaseManager(timeout_seconds=15)
         
-
+    #------------------------------
+    # NATS Server
+    # -----------------------------
+    
+    async def init_nats(self):
+        self.nats = NATSClient()
+        
+        self.loop = asyncio.get_running_loop()
+        
+        await self.nats.connect()
+        await self.nats.subscribe("axr.results", self._on_result)
+        print("[NATS] Scheduler connected and subscribed to axr.results")    
+        
     # ---------------------------
     # Kernel registration methods
     # ---------------------------
@@ -98,7 +116,8 @@ class ProcessScheduler:
     def _schedule_cycle(self) -> None:
         with self._lock:
             active_processes = [
-                p for p in self.processes.values() if p.is_active()
+                p for p in self.processes.values() 
+                if p.is_active() and not getattr(p, "finalized", False)
             ]
 
         futures = []
@@ -116,7 +135,8 @@ class ProcessScheduler:
             steps = self.steps.get(process.pid, [])
             resolver = ProcessGraphResolver(steps)
             runnable_steps = resolver.resolve()
-            print(f"\n[RESOLVE] Runnable steps: {[s.syscall for s in runnable_steps]}")
+            if runnable_steps:
+                print(f"\n[RESOLVE] Runnable steps: {[s.syscall for s in runnable_steps]}")
 
             for step in runnable_steps:
                 if step.status != StepStatus.READY:
@@ -156,7 +176,8 @@ class ProcessScheduler:
         # Wait for step execution to complete
         for future in as_completed(futures):
             pass
-
+        
+        self._check_expired_leases()
         # Check process completion
         self._finalize_processes()
 
@@ -177,35 +198,30 @@ class ProcessScheduler:
         try:
             print(f"[EXEC] PID= {process.pid} STEP= {step.syscall}")
 
-            # Charge budget first
+            # Charge budget before dispatch
             process.charge_budget(step.cost_estimate)
-
-            # Execute via kernel syscall handler
-            result = self.exec_handler.run(process, step, self.memory_manager)
-            
-            # Write output to process memory
-            self.memory_manager.write_output(process.pid, step.step_id, result)
-
-            print(f"[DONE] STEP= {step.syscall} RESULT= {result}")
-
-            step.succeed()
-            
-            self.repo.save_step(step)
             self.repo.save_process(process)
             
-            self.event_bus.publish(
-                Event(
-                    event_type="STEP_SUCCEEDED",
-                    pid=process.pid,
-                    step_id=step.step_id,
-                )
+            process_memory = self.memory_manager.read_process_memory(process.pid)
+            
+            # JSON-safe: convert UUID keys -> str
+            json_safe_memory = {
+                str(k): v for k, v in process_memory.items()
+            }
+            
+            # Dispatch task to NATS (instead of local execution)
+            payload = task_message(process, step, memory_inputs=json_safe_memory)
+            
+            asyncio.run_coroutine_threadsafe(
+                self.nats.publish("axr.tasks", payload),
+                self.loop,
             )
             
-            self.checkpoint_manager.save_checkpoint(
-                process, self.steps[process.pid]
-            )
-            self.resource_manager.release(process.pid)
-
+            print(f"[NATS] Dispatched {step.syscall} to workers")
+            
+            self.lease_manager.start_lease(process.pid, step.step_id)
+            
+            
         except PermissionError as e:
             step.fail(str(e))
             self.repo.save_step(step)
@@ -249,7 +265,6 @@ class ProcessScheduler:
                 )
             )
             self.transaction_manager.rollback_process(process, self.steps[process.pid])
-            self.resource_manager.release(process.pid)
 
         except Exception as e:
             step.fail(str(e))
@@ -294,10 +309,8 @@ class ProcessScheduler:
             )
             print(f"[FAIL] STEP={step.syscall} ERROR={e}")
             self.transaction_manager.rollback_process(process, self.steps[process.pid])
-            self.resource_manager.release(process.pid)
     
-        finally:
-            self.resource_manager.release(process.pid)
+    
     # ---------------------------
     # Process completion check
     # ---------------------------
@@ -305,6 +318,11 @@ class ProcessScheduler:
     def _finalize_processes(self) -> None:
         with self._lock:
             for pid, process in self.processes.items():
+
+                # ✅ Skip already finalized processes
+                if getattr(process, "finalized", False):
+                    continue
+
                 steps = self.steps.get(pid, [])
 
                 if not steps:
@@ -317,6 +335,7 @@ class ProcessScheduler:
 
                 any_failed = any(step.status == StepStatus.FAILED for step in steps)
 
+                # 🎉 SUCCESS PATH
                 if all_done:
                     self.event_bus.publish(
                         Event(
@@ -324,8 +343,14 @@ class ProcessScheduler:
                             pid=process.pid,
                         )
                     )
-                    process.terminate()
 
+                    process.terminate()
+                    process.finalized = True  # 🔴 prevent re-emission
+                    self.repo.save_process(process)
+
+                    print(f"[PROCESS] {process.pid} finalized as SUCCEEDED")
+
+                # ❌ FAILURE PATH
                 elif any_failed and process.state != ProcessState.FAILED:
                     self.event_bus.publish(
                         Event(
@@ -333,7 +358,12 @@ class ProcessScheduler:
                             pid=process.pid,
                         )
                     )
+
                     process.fail("One or more steps failed")
+                    process.finalized = True  # 🔴 prevent re-emission
+                    self.repo.save_process(process)
+
+                    print(f"[PROCESS] {process.pid} finalized as FAILED")
                     
     def resume_process(self, process: AIProcess):
         print(f"[RESUME] Restoring process {process.pid}")
@@ -346,8 +376,90 @@ class ProcessScheduler:
         
         process.state =  ProcessState.RUNNING
     
+    
+    async def _on_result(self, msg):
+        import json
+        
+        data = json.loads(msg.data.decode())
+        
+        pid = UUID(data['pid'])
+        step_id = UUID(data['step_id'])
+        
+        process = self.processes.get(pid)
+        steps = self.steps.get(pid, [])
+        
+        step = next((s for s in steps if s.step_id == step_id), None)
+        if not step:
+            return
+        
+        self.lease_manager.complete_lease(step_id)
+
+        if data['status'] == "success":
+            step.succeed()
+        
+            if data.get("output"):
+                self.memory_manager.write_output(pid, step_id, data["output"])
+            
+            
+            self.event_bus.publish(
+                Event(event_type="STEP_SUCCEEDED", pid=pid, step_id=step_id
+                      )
+            )
+        
+        else:
+            step.fail(data.get("error", "Worker failure"))
+            
+            self.event_bus.publish(
+                Event(
+                    event_type="STEP_FAILED",
+                    pid=pid,
+                    step_id=step_id,
+                    metadata={"error": data.get("error")},
+                )
+            )
+        
+        self.repo.save_step(step)
+        self.repo.save_process(process)
+        
+        self.resource_manager.release(pid)
+        
+    def _check_expired_leases(self):
+        expired = self.lease_manager.get_expired()
+
+        for pid, step_id in expired:
+            print(f"[LEASE] Step {step_id} expired → requeue")
+
+            steps = self.steps.get(pid, [])
+            step = next((s for s in steps if s.step_id == step_id), None)
+
+            if not step:
+                continue
+
+            # mark step back to READY
+            step.status = StepStatus.READY
+            step.retries += 1
+
+            self.event_bus.publish(
+                Event(
+                    event_type="STEP_REQUEUED",
+                    pid=pid,
+                    step_id=step_id,
+                    metadata={"reason": "lease_timeout", "retry": step.retries},
+                )
+            )
+
+            # release resource slot
+            self.resource_manager.release(pid)
+
+            # remove old lease
+            self.lease_manager.complete_lease(step_id)
+       
+    
     def run_once(self) -> None:
         """
         Run ad single scheduling cycle (for testing).
         """
         self._schedule_cycle()
+
+
+    
