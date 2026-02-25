@@ -25,6 +25,7 @@ from axr_core.persistence.repository import PersistenceRepository
 from axr_core.distributed.nats_client import NATSClient
 from axr_core.distributed.message import task_message
 from axr_core.reliability.lease_manager import LeaseManager
+from axr_core.distributed.worker_registry import WorkerRegistry
 import asyncio
 
 
@@ -38,7 +39,7 @@ class ProcessScheduler:
     - parallel execution
     """
 
-    def __init__(self, max_workers: int = 4, poll_interval: float = 1.0):
+    def __init__(self, max_workers: int = 4, poll_interval: float = 0.1):
         self.processes: Dict[UUID, AIProcess] = {}
         self.steps: Dict[UUID, List[ProcessStep]] = {}
 
@@ -63,7 +64,14 @@ class ProcessScheduler:
         self.retry_manager = RetryManager()
         self.resource_manager = ResourceManager()
         self.lease_manager = LeaseManager(timeout_seconds=15)
+        self.worker_registry = WorkerRegistry(ttl_seconds=10)
         
+        self._rr_index = {}
+        self._lease_worker_map: Dict[UUID, str] = {}
+        
+        self.max_parallel_per_process = 2
+        self._active_steps_per_process: Dict[UUID, int] = {}
+
     #------------------------------
     # NATS Server
     # -----------------------------
@@ -75,6 +83,7 @@ class ProcessScheduler:
         
         await self.nats.connect()
         await self.nats.subscribe("axr.results", self._on_result)
+        await self.nats.subscribe("axr.heartbeat", cb=self._handle_heartbeat)
         print("[NATS] Scheduler connected and subscribed to axr.results")    
         
     # ---------------------------
@@ -87,7 +96,7 @@ class ProcessScheduler:
             self.steps[process.pid] = steps
             self.resource_manager.register_process(
                 process.pid,
-                ProcessResources(max_concurrent_steps=1, max_budget=process.budget_limit),
+                ProcessResources(max_concurrent_steps=10, max_budget=process.budget_limit),
             )
             
             self.repo.save_process(process)
@@ -127,6 +136,8 @@ class ProcessScheduler:
             
             if process.state == ProcessState.READY:
                 process.start()
+                self._active_steps_per_process[process.pid] = 0
+                
 
                 self.event_bus.publish(
                     Event(event_type="PROCESS_STARTED", pid=process.pid)
@@ -135,10 +146,24 @@ class ProcessScheduler:
             steps = self.steps.get(process.pid, [])
             resolver = ProcessGraphResolver(steps)
             runnable_steps = resolver.resolve()
+            
+            for s in runnable_steps:
+                if s.status == StepStatus.PENDING:
+                    s.mark_ready()
+            
+            runnable_steps.sort(key=lambda s:s.priority)
             if runnable_steps:
                 print(f"\n[RESOLVE] Runnable steps: {[s.syscall for s in runnable_steps]}")
 
             for step in runnable_steps:
+                
+                active = self._active_steps_per_process.get(process.pid, 0)
+                if active >= self.max_parallel_per_process:
+                    print(f"[FAIR] Process {process.pid} hit parallel limit")
+                    
+                if step.status == StepStatus.RUNNING:
+                    continue
+                    
                 if step.status != StepStatus.READY:
                     continue
                 
@@ -168,12 +193,22 @@ class ProcessScheduler:
                 
                 # Allocate resource slot
                 self.resource_manager.allocate(process.pid)
+                self._active_steps_per_process[process.pid] = active + 1
+                
+                print(
+                    f"[FAIR-DEBUG] pid= {process.pid}  active="
+                    f"{self._active_steps_per_process.get(process.pid, 0)}"
+                )
+                
+                with self._lock:
+                    self._active_steps_per_process[process.pid] = active + 1
                 
                 futures.append(
                     self.executor.submit(self._execute_step, process, step)
                 )
+                # self._execute_step(process, step)
 
-        # Wait for step execution to complete
+        # # Wait for step execution to complete
         for future in as_completed(futures):
             pass
         
@@ -209,21 +244,78 @@ class ProcessScheduler:
                 str(k): v for k, v in process_memory.items()
             }
             
+            # Workers that support this tool
+            workers = self.worker_registry.get_workers_for_tool(step.syscall)
+            
+            if not workers:
+                print(f"[ROUTE] No workers available for {step.syscall}")
+                
+                step.status = StepStatus.READY
+                self.resource_manager.release(process.pid)
+                
+                with self._lock:
+                    self._active_steps_per_process[process.pid] = max(0, self._active_steps_per_process[process.pid] -1)
+                return
+            
+            live_workers =  self.worker_registry.get_live_workers()
+            worker_load = self._get_worker_load()
+            
+            print(f"[ROUTE-DEBUG] live workers: {live_workers}")
+            print(f"[ROUTE-DEBUG] worker load: {worker_load}")
+            
+            # Capacity filtering
+            eligible = []
+            
+            for wid in workers:
+                capacity = live_workers[wid].get("capacity",1)
+                active = worker_load.get(wid, 0)
+                
+                if active < capacity:
+                    eligible.append(wid)
+            
+            if not eligible:
+                print(f"[ROUTE] All workers at capacity for {step.syscall}")
+                step.status =  StepStatus.READY
+                
+                with self._lock:
+                    self._active_steps_per_process[process.pid] = max(0, self._active_steps_per_process[process.pid] -1)
+                self.resource_manager.release(process.pid)
+                return
+            
+            rr = self._rr_index.get(step.syscall, 0)
+            
+            scored = []
+            
+            for i, w in enumerate(eligible):
+                load = worker_load.get(w,0)
+                rr_offset = (i - rr) % len(eligible)
+                scored.append((w, load, rr_offset))
+            
+            target_worker = min(scored, key=lambda x: (x[1], x[2]))[0]
+            
+            self._rr_index[step.syscall] = (rr + 1) % len(eligible)
+            
             # Dispatch task to NATS (instead of local execution)
             payload = task_message(process, step, memory_inputs=json_safe_memory)
             
+            print(f"[NATS-PUB] subject= axr.tasks.{target_worker} size= {len(payload)}")
+            
             asyncio.run_coroutine_threadsafe(
-                self.nats.publish("axr.tasks", payload),
+                self.nats.publish(f"axr.tasks.{target_worker}",payload),
                 self.loop,
             )
             
-            print(f"[NATS] Dispatched {step.syscall} to workers")
             
-            self.lease_manager.start_lease(process.pid, step.step_id)
+            print(f"[ROUTE] {step.syscall} -> {target_worker}")
+            
+            self.lease_manager.start_lease(process.pid, step.step_id, target_worker)
+            self._lease_worker_map[step.step_id] = target_worker
             
             
         except PermissionError as e:
             step.fail(str(e))
+            with self._lock:
+                self._active_steps_per_process[process.pid] = max(0, self._active_steps_per_process[process.pid] -1)
             self.repo.save_step(step)
             self.repo.save_process(process)
 
@@ -268,6 +360,8 @@ class ProcessScheduler:
 
         except Exception as e:
             step.fail(str(e))
+            with self._lock:
+                self._active_steps_per_process[process.pid] = max(0, self._active_steps_per_process[process.pid] -1)
             self.repo.save_step(step)
             self.repo.save_process(process)
 
@@ -319,7 +413,7 @@ class ProcessScheduler:
         with self._lock:
             for pid, process in self.processes.items():
 
-                # ✅ Skip already finalized processes
+                # Skip already finalized processes
                 if getattr(process, "finalized", False):
                     continue
 
@@ -335,7 +429,7 @@ class ProcessScheduler:
 
                 any_failed = any(step.status == StepStatus.FAILED for step in steps)
 
-                # 🎉 SUCCESS PATH
+                # SUCCESS PATH
                 if all_done:
                     self.event_bus.publish(
                         Event(
@@ -345,12 +439,13 @@ class ProcessScheduler:
                     )
 
                     process.terminate()
-                    process.finalized = True  # 🔴 prevent re-emission
+                    process.finalized = True  # prevent re-emission
+                    self._active_steps_per_process.pop(process.pid, None)
                     self.repo.save_process(process)
 
                     print(f"[PROCESS] {process.pid} finalized as SUCCEEDED")
 
-                # ❌ FAILURE PATH
+                # FAILURE PATH
                 elif any_failed and process.state != ProcessState.FAILED:
                     self.event_bus.publish(
                         Event(
@@ -360,11 +455,13 @@ class ProcessScheduler:
                     )
 
                     process.fail("One or more steps failed")
-                    process.finalized = True  # 🔴 prevent re-emission
+                    process.finalized = True  # prevent re-emission
+                    self._active_steps_per_process.pop(process.pid, None)
                     self.repo.save_process(process)
 
                     print(f"[PROCESS] {process.pid} finalized as FAILED")
                     
+    
     def resume_process(self, process: AIProcess):
         print(f"[RESUME] Restoring process {process.pid}")
         
@@ -393,6 +490,13 @@ class ProcessScheduler:
             return
         
         self.lease_manager.complete_lease(step_id)
+        self._lease_worker_map.pop(step_id, None)
+        
+        if pid in self._active_steps_per_process:
+            self._active_steps_per_process[pid] = max(
+                0, 
+                self._active_steps_per_process.get(pid, 0) -1
+            )
 
         if data['status'] == "success":
             step.succeed()
@@ -422,6 +526,22 @@ class ProcessScheduler:
         self.repo.save_process(process)
         
         self.resource_manager.release(pid)
+        print(f"[RESULT] RAW {msg.subject} {msg.data}")
+        
+    async def _handle_heartbeat(self, msg):
+        import json
+        
+        data = json.loads(msg.data.decode())
+        
+        worker_id = data["worker_id"]
+        tools = data["tools"]
+        capacity = data.get("capacity", 1)
+        
+        self.worker_registry.register(worker_id, tools, capacity)
+        
+        print(f"[HB] Woker {worker_id} tools= {tools}")
+        
+        
         
     def _check_expired_leases(self):
         expired = self.lease_manager.get_expired()
@@ -453,7 +573,22 @@ class ProcessScheduler:
 
             # remove old lease
             self.lease_manager.complete_lease(step_id)
+            
+            if pid in self._active_steps_per_process:
+                self._active_steps_per_process[pid] = max(
+                    0,
+                    self._active_steps_per_process[pid] - 1
+                )
        
+    
+    def _get_worker_load(self):
+        load = {}
+        
+        for step_id, worker_id in self._lease_worker_map.items():
+            load[worker_id] = load.get(worker_id, 0) + 1
+        
+        return load
+    
     
     def run_once(self) -> None:
         """

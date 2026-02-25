@@ -45,6 +45,7 @@ class ProcessStep:
     input_ref: Optional[str] = None
     output_ref: Optional[str] = None
     finalized: bool = False
+    priority: int = 1
     
     # -------------------------------
     # State transitions
@@ -56,7 +57,7 @@ class ProcessStep:
             
     def start(self) -> None:
         if self.status not in {StepStatus.READY}:
-            raise RuntimeError("Step must be READY to start")
+            raise RuntimeError(f"Step {self.step_id} must be READY to start, current: {self.status}")
 
         self.status = StepStatus.RUNNING
     
