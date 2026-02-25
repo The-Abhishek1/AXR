@@ -2,55 +2,51 @@ from fastapi import APIRouter, Request
 from uuid import UUID
 
 from axr_core.process_manager.process import AIProcess
-from axr_core.process_graph.models import ProcessStep
+from tool_registry.registry import tool_registry
+from axr_core.agents.planner.plan_to_steps import plan_to_steps
+from axr_core.agents.planner.planner_agent import PlannerAgent
 
 router = APIRouter()
 
 
+# -------------------------
+# Submit process
+# -------------------------
 @router.post("/")
-def submit_process(request: Request):
+async def submit_process(request: Request):
     scheduler = request.app.state.scheduler
+    llm = request.app.state.llm
 
-    process = AIProcess(intent="demo", budget_limit=100)
+    body = await request.json()
+    goal = body.get("goal")
 
-    step1 = ProcessStep(
-        pid=process.pid,
-        syscall="git.clone",
-        priority=1
-    )
+    if not goal:
+        return {"error": "Missing goal"}
 
-    step2 = ProcessStep(
-        pid= process.pid,
-        syscall="sast.scan",
-        depends_on=[step1.step_id],
-        priority =0
-    )
+    # 1️⃣ Create process
+    process = AIProcess(intent=goal, budget_limit=100)
 
-    step3 = ProcessStep(
-        pid=process.pid,
-        syscall="lint",
-        depends_on=[step1.step_id],
-        priority = 1
-    )
+    # 2️⃣ Run planner
+    planner = PlannerAgent(llm, tool_registry)
+    plan = planner.create_plan(goal)
 
-    step4 = ProcessStep(
-        pid=process.pid,
-        syscall="deploy.service",
-        depends_on=[step2.step_id, step3.step_id],
-        priority = 2
-    )
+    # 3️⃣ Convert plan → steps
+    steps = plan_to_steps(process.pid, plan)
 
-    steps = [step1, step2, step3, step4]
-
+    # 4️⃣ Register in scheduler
     scheduler.register_process(process, steps)
 
-    return {"pid": process.pid}
+
+    return {
+        "pid": process.pid,
+        "plan": plan,
+        "step_count": len(steps),
+    }
 
 
 # -------------------------
 # Get process status
 # -------------------------
-
 @router.get("/{pid}")
 def get_process(pid: UUID, request: Request):
     scheduler = request.app.state.scheduler
@@ -70,8 +66,9 @@ def get_process(pid: UUID, request: Request):
                 "syscall": step.syscall,
                 "status": step.status,
                 "retries": step.retries,
+                "depends_on": step.depends_on,
+                "priority": step.priority,
             }
             for step in steps
         ],
     }
-    

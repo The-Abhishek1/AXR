@@ -5,8 +5,10 @@ import time
 from axr_core.process_scheduler.scheduler import ProcessScheduler
 from axr_core.persistence.models import Base
 
-from api.routes import tasks, tools, policies, replay, events
+from api.routes import tasks, tools, policies, replay, events, processes, workers, events_ui, dashboard
 from api.deps.db import engine
+from openai import OpenAI
+from axr_core.agents.llm_client import LLMClient
 
 
 app = FastAPI()
@@ -16,6 +18,9 @@ scheduler = ProcessScheduler(max_workers=4)
 
 # Make scheduler accessible to routes
 app.state.scheduler = scheduler
+
+# LLM client for planner
+app.state.llm = LLMClient(OpenAI(api_key=""))
 
 def scheduler_loop():
     while True:
@@ -40,3 +45,7 @@ app.include_router(replay.router, prefix="/replay", tags=["replay"])
 app.include_router(events.router, prefix="/events", tags=["events"])
 
 
+app.include_router(processes.router)
+app.include_router(workers.router)
+app.include_router(events_ui.router)
+app.include_router(dashboard.router)

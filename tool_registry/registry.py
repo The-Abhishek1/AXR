@@ -1,9 +1,14 @@
-from typing import Dict
+from typing import Dict, List
 
 from tool_runtime.git_tool.tool import GitTool
 from tool_runtime.sast_tool.tool import SASTTool
 from tool_runtime.lint_tool.tool import LINTTool
 from tool_runtime.deploy_tool.tool import DEPLOYTool
+
+class ToolMeta:
+    def __init__(self, name: str, description: str):
+        self.name = name
+        self.description = description
 
 class ToolRegistry:
     """
@@ -12,8 +17,10 @@ class ToolRegistry:
     """
 
     def __init__(self):
-        self._tools: Dict[str, object] = {}
+        self._meta: Dict[str, ToolMeta] = {}
+        self._runtime: Dict[str, object] = {}
         self._register_builtin_tools()
+        
 
     # ---------------------------
     # Registration
@@ -24,20 +31,47 @@ class ToolRegistry:
         Register core tools here.
         Later this will be dynamic via loader + manifests.
         """
-        self._tools["git.clone"] = GitTool()
-        self._tools["sast.scan"] = SASTTool()
-        self._tools["lint"] = LINTTool()
-        self._tools["deploy.service"] = DEPLOYTool()
+        self.register(
+            "git.clone",
+            "Clone a a git repository",
+            GitTool(),   
+        )
+        self.register(
+            "sast.scan",
+            "Run static security scan",
+            SASTTool(),   
+        )
+        self.register(
+            "lint",
+            "Lint the source code",
+            LINTTool(),   
+        )
+        self.register(
+            "deploy.service",
+            "Deploy the application",
+            DEPLOYTool(),   
+        )
+        
+    def register(self, name: str, description: str, runtime):
+        self._meta[name] = ToolMeta(name, description)
+        self._runtime[name] = runtime
 
     # ---------------------------
-    # Public API
+    # Planner API
+    # ---------------------------
+    
+    def list_tools(self) -> List[ToolMeta]:
+        return list(self._meta.values())
+    
+    
+    # ---------------------------
+    # Executor API
     # ---------------------------
 
     def get_tool(self, syscall: str):
-        tool = self._tools.get(syscall)
+        tool = self._runtime.get(syscall)
         if not tool:
             raise NotImplementedError(f"No tool registered for syscall: {syscall}")
         return tool
 
-    def list_tools(self):
-        return list(self._tools.keys())
+tool_registry = ToolRegistry()

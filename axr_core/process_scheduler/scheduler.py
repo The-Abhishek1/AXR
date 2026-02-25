@@ -55,6 +55,7 @@ class ProcessScheduler:
         )
         
         self.capability_issuer = CapabilityIssuer()
+        self.capability_validator = CapabilityValidator()
         self.exec_handler = ExecHandler()
         self.memory_manager = ProcessMemoryManager()
         self.repo = PersistenceRepository()
@@ -239,6 +240,16 @@ class ProcessScheduler:
             
             process_memory = self.memory_manager.read_process_memory(process.pid)
             
+            # Capability Issue
+            cap = self.capability_issuer.issue(
+                pid =process.pid,
+                step_id= step.step_id,
+                syscall=step.syscall,
+                budget_limit=step.cost_estimate
+            )
+            
+            print(f"[CAP] Issued cap_id= {cap.cap_id} syscall= {cap.syscall}")
+            
             # JSON-safe: convert UUID keys -> str
             json_safe_memory = {
                 str(k): v for k, v in process_memory.items()
@@ -296,7 +307,7 @@ class ProcessScheduler:
             self._rr_index[step.syscall] = (rr + 1) % len(eligible)
             
             # Dispatch task to NATS (instead of local execution)
-            payload = task_message(process, step, memory_inputs=json_safe_memory)
+            payload = task_message(process, step, memory_inputs=json_safe_memory, capability=cap)
             
             print(f"[NATS-PUB] subject= axr.tasks.{target_worker} size= {len(payload)}")
             
@@ -476,17 +487,52 @@ class ProcessScheduler:
     
     async def _on_result(self, msg):
         import json
+        from axr_core.capabilities.models import Capability
+        from datetime import datetime
         
         data = json.loads(msg.data.decode())
-        
         pid = UUID(data['pid'])
         step_id = UUID(data['step_id'])
         
         process = self.processes.get(pid)
         steps = self.steps.get(pid, [])
-        
         step = next((s for s in steps if s.step_id == step_id), None)
+        
         if not step:
+            return
+        
+        cap_data = data.get("capability")
+        
+        print(f"[RESULT] capability present? {cap_data is not None}")
+        
+        if cap_data:
+           
+            cap = Capability(
+            cap_id=UUID(cap_data["cap_id"]),
+            pid=UUID(cap_data["pid"]),
+            step_id=UUID(cap_data["step_id"]),
+            syscall=cap_data["syscall"],
+            issued_at=datetime.fromisoformat(cap_data["issued_at"]),
+            expires_at=datetime.fromisoformat(cap_data["expires_at"]),
+            budget_limit=cap_data["budget_limit"],
+            signature=cap_data["signature"],
+            )
+            
+            
+            if not self.capability_validator.validate(cap):
+                print(f"[CAP] Invalid capability for step {data['step_id']}")
+                step.fail("Invalid capability")
+                self.repo.save_step(step)
+                return
+            else:
+                print(f"[CAP] Valid capability for step {data['step_id']}")
+        
+        else:
+            print(f"[CAP-ERROR] Missing capability for step {step_id}")
+            step.fail("Missing capability token")
+            self.repo.save_step(step)
+            self.repo.save_process(process)
+            self.resource_manager.release(pid)
             return
         
         self.lease_manager.complete_lease(step_id)

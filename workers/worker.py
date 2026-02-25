@@ -5,6 +5,10 @@ import uuid
 from nats.aio.client import Client as NATS 
 from tool_registry.registry import ToolRegistry
 from axr_core.distributed.message import result_message
+from axr_core.capabilities.models import Capability
+from datetime import datetime
+from uuid import UUID
+
 
 registry = ToolRegistry()
 
@@ -20,6 +24,21 @@ async def main():
         print(f"[WORKER {worker_id}] RAW MSG {msg.subject}")
 
         data = json.loads(msg.data.decode())
+        
+        cap_data = data.get("capability")
+        cap = None
+
+        if cap_data:
+            cap = Capability(
+                cap_id=UUID(cap_data["cap_id"]),
+                pid=UUID(cap_data["pid"]),
+                step_id=UUID(cap_data["step_id"]),
+                syscall=cap_data["syscall"],
+                issued_at=datetime.fromisoformat(cap_data["issued_at"]),
+                expires_at=datetime.fromisoformat(cap_data["expires_at"]),
+                budget_limit=cap_data["budget_limit"],
+                signature=cap_data["signature"],
+                )
 
         pid = data["pid"]
         step_id = data["step_id"]
@@ -36,11 +55,11 @@ async def main():
 
             process_ctx = WorkerProcess(pid)
 
-            result = tool.execute(process_ctx, data.get("inputs", {}), None)
+            result = tool.execute(process_ctx, data.get("inputs", {}), cap)
 
             await nc.publish(
                 "axr.results",
-                result_message(pid, step_id, "success", output=result),
+                result_message(pid, step_id, "success", output=result, error=None, capability= cap),
             )
 
             print(f"[WORKER {worker_id}] Completed {syscall}")
@@ -48,7 +67,7 @@ async def main():
         except Exception as e:
             await nc.publish(
                 "axr.results",
-                result_message(pid, step_id, "failed", error=str(e)),
+                result_message(pid, step_id, "failed", output=None, error=str(e), capability=cap),
             )
             print(f"[WORKER {worker_id}] Failed {syscall}: {e}")
 
@@ -66,7 +85,7 @@ async def main():
                 "axr.heartbeat",
                 json.dumps({
                     "worker_id": worker_id,
-                    "tools": registry.list_tools(),
+                    "tools": [tool.name for tool in registry.list_tools()],
                     "capacity": WORKER_CAPACITY,
                 }).encode(),
             )
