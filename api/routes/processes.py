@@ -183,30 +183,22 @@ def cancel_process(pid: UUID, request: Request):
 
     return {"status": "cancelled", "pid": str(pid)}
 
+@router.post("/processes/{pid}/pause")
+def pause_process(pid: UUID, request: Request):
+    scheduler = request.app.state.scheduler
+    ok = scheduler.pause_process(pid)
+    if not ok:
+        raise HTTPException(status_code=404, detail="Process not found")
 
-def pause_process(self, pid: UUID):
-    process = self.processes.get(pid)
-    if not process:
-        return False
-
-    process.pause()
-    self.repo.save_process(process)
-
-    self.event_bus.publish(
-        Event(event_type="PROCESS_PAUSED", pid=pid)
-    )
-    return True
+    return {"status": "paused", "pid": str(pid)}
 
 
-def resume_process(self, pid: UUID):
-    process = self.processes.get(pid)
-    if not process:
-        return False
+@router.post("/processes/{pid}/resume")
+def resume_process(pid: UUID, request: Request):
+    scheduler = request.app.state.scheduler
+    ok = scheduler.resume_process(pid)
+    if not ok:
+        raise HTTPException(status_code=404, detail="Process not found")
 
-    process.resume()
-    self.repo.save_process(process)
+    return {"status": "resumed", "pid": str(pid)}
 
-    self.event_bus.publish(
-        Event(event_type="PROCESS_RESUMED", pid=pid)
-    )
-    return True

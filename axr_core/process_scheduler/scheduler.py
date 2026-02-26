@@ -58,12 +58,12 @@ class ProcessScheduler:
         self.checkpoint_manager = CheckpointManager(self.memory_manager)
         self.retry_manager = RetryManager()
         self.resource_manager = ResourceManager()
-        self.lease_manager = LeaseManager(timeout_seconds=15)
+        self.lease_manager = LeaseManager(timeout_seconds=1500000)
         self.worker_registry = WorkerRegistry(ttl_seconds=10)
 
         self._lease_worker_map: Dict[UUID, str] = {}
         
-        self.max_parallel_per_process = 2
+        self.max_parallel_per_process = 10
         self._active_steps_per_process: Dict[UUID, int] = {}
         
         self._retry_queue: Dict[UUID, float] = {}  # step_id -> next_retry_timestamp
@@ -344,9 +344,26 @@ class ProcessScheduler:
 
             target_worker = min(scored, key=lambda x: (x[1], x[2]))[0]
             self._rr_index[step.syscall] = (rr + 1) % len(eligible)
+            
+            # Capability Issue
+            cap = self.capability_issuer.issue(
+                pid =process.pid,
+                step_id= step.step_id,
+                syscall=step.syscall,
+                budget_limit=step.cost_estimate
+            )
+            
+            print(f"[CAP] Issued cap_id= {cap.cap_id} syscall= {cap.syscall}")
+            
+            process_memory = self.memory_manager.read_process_memory(process.pid)
 
+            # JSON-safe: convert UUID keys -> str
+            json_safe_memory = {
+                str(k): v for k, v in process_memory.items()
+            }
+            
             # 🛰️ DISPATCH TO NATS
-            payload = task_message(process, step, memory_inputs={}, capability=None)
+            payload = task_message(process, step, memory_inputs=json_safe_memory, capability=cap)
 
             print(
                 f"[NATS-PUB] subject= axr.tasks.{target_worker} size={len(payload)}"
@@ -362,6 +379,8 @@ class ProcessScheduler:
             # ⏱️ START LEASE (for load tracking)
             self.lease_manager.start_lease(process.pid, step.step_id, target_worker)
             self._lease_worker_map[step.step_id] = target_worker
+            
+
 
         except Exception as e:
             step.fail(str(e))
@@ -405,6 +424,8 @@ class ProcessScheduler:
     
     async def _on_result(self, msg):
         import json
+        from axr_core.capabilities.models import Capability
+        from datetime import datetime
 
         data = json.loads(msg.data.decode())
 
@@ -425,6 +446,41 @@ class ProcessScheduler:
         # 🚫 Ignore results for failed/finalized process
         if process.state == ProcessState.FAILED or getattr(process, "finalized", False):
             print(f"[RESULT-IGNORED] Process {pid} already failed")
+            return
+        
+        cap_data = data.get("capability")
+        
+        if cap_data:
+           
+            cap = Capability(
+            cap_id=UUID(cap_data["cap_id"]),
+            pid=UUID(cap_data["pid"]),
+            step_id=UUID(cap_data["step_id"]),
+            syscall=cap_data["syscall"],
+            issued_at=datetime.fromisoformat(cap_data["issued_at"]),
+            expires_at=datetime.fromisoformat(cap_data["expires_at"]),
+            budget_limit=cap_data["budget_limit"],
+            signature=cap_data["signature"],
+            )
+            
+            
+            if not self.capability_validator.validate(cap):
+                print(f"[CAP] Invalid capability for step {data['step_id']}")
+                step.fail("Invalid capability")
+                self.repo.save_step(step)
+                return
+            else:
+                print(f"[CAP] Valid capability for step {data['step_id']}")
+        
+        else:
+            print(f"[CAP-ERROR] Missing capability for step {step_id}")
+            step.fail("Missing capability token")
+            self.repo.save_step(step)
+            self.repo.save_process(process)
+            self.resource_manager.release(pid)
+            # ✅ COMPLETE LEASE
+            self.lease_manager.complete_lease(step_id)
+            self._lease_worker_map.pop(step_id, None)
             return
 
         # ✅ COMPLETE LEASE
@@ -455,6 +511,14 @@ class ProcessScheduler:
                     step_id=step_id,
                 )
             )
+            # after STEP_SUCCEEDED event publish
+
+            # 🔐 CHECKPOINT (safe point)
+            self.checkpoint_manager.save_checkpoint(
+                process,
+                self.steps.get(pid, [])
+            )
+            
         # -------------------------
         # FAILURE
         # -------------------------
@@ -531,6 +595,7 @@ class ProcessScheduler:
                 any_failed = any(step.status == StepStatus.FAILED for step in steps)
                 any_skipped = any(step.status == StepStatus.SKIPPED for step in steps)
                 all_success = all(step.status == StepStatus.SUCCESS for step in steps)
+                
                 # FAILURE (FAILED or SKIPPED → your rule)
                 if (any_failed or any_skipped) and process.state != ProcessState.FAILED:
                     print(f"[PROCESS] {pid} transitioning to FAILED → triggering rollback")
@@ -543,6 +608,14 @@ class ProcessScheduler:
                     # 🔥 TRANSACTION ROLLBACK
                     try:
                         self.transaction_manager.rollback_process(process, steps)
+                        # after STEP_SUCCEEDED event publish
+
+                        # 🔐 CHECKPOINT (safe point)
+                        self.checkpoint_manager.save_checkpoint(
+                            process,
+                            self.steps.get(pid, [])
+                        )
+                        
                     except Exception as e:
                         print(f"[TXN-ERROR] Rollback failed for PID={pid}: {e}")
 
@@ -557,6 +630,8 @@ class ProcessScheduler:
 
                 # SUCCESS
                 if all_success:
+                    # 🔐 CHECKPOINT after rollback (new consistent state)
+                    self.checkpoint_manager.save_checkpoint(process, steps)
                     process.terminate()
                     process.finalized = True
 
@@ -757,7 +832,6 @@ class ProcessScheduler:
                 step.status = StepStatus.PENDING
                 print(f"[RESTORE] {step.syscall} RUNNING → PENDING")
 
-        self.checkpoint_manager.restore_checkpoint(process, steps)
         print(f"[RESTORE] Memory restored for {process.pid}")
         
         any_failed = any(s.status == StepStatus.FAILED for s in steps)
@@ -779,8 +853,12 @@ class ProcessScheduler:
             
         self._active_steps_per_process[process.pid] = 0
         self._global_active_steps = 0
+        
         # 🔥 reset resource usage for restored process
         self.resource_manager.reset_usage(process.pid)
+        
+        # 🔐 persist restored state as new checkpoint baseline
+        self.checkpoint_manager.save_checkpoint(process, steps)
     
     
     
