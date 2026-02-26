@@ -12,6 +12,9 @@ class ProcessState(str, Enum):
     BLOCKED = "BLOCKED"
     TERMINATED = "TERMINATED"
     FAILED = "FAILED"
+    PAUSED = "PAUSED"
+    ROLLBACK_PENDING = "ROLLBACK_PENDING"
+    ROLLBACK_RUNNING = "ROLLBACK_RUNNING"
     
 @dataclass
 class AIProcess:
@@ -72,6 +75,11 @@ class AIProcess:
         self.error_message = message
         self.terminated_at = datetime.utcnow()
         
+    def pause(self):
+        self.state = ProcessState.PAUSED
+    
+    def resume(self):
+        self.state = ProcessState.RUNNING
     
     # --------------------------------
     # Resource management
@@ -80,12 +88,12 @@ class AIProcess:
     def charge_budget(self, amount: float) -> None:
         if amount < 0:
             raise ValueError("Budget charge cannot be negative")
-        
+
         if self.budget_used + amount > self.budget_limit:
             raise RuntimeError("Budget limit exceeded")
-        
-        self.budget_limit += amount
-        
+
+        self.budget_used += amount
+            
     def remaining_budget(self) -> float:
         return self.budget_limit - self.budget_used
     

@@ -1,5 +1,7 @@
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, Request, HTTPException
 from uuid import UUID
+from axr_core.process_scheduler.scheduler import ProcessScheduler
+from axr_core.process_graph.models import StepStatus
 
 router = APIRouter()
 
@@ -80,3 +82,131 @@ def get_process_detail(pid: str, request: Request):
         else None,
         "steps": step_details,
     }
+    
+    
+    
+@router.get("/steps/{step_id}")
+def get_step_detail(step_id: str, request: Request):
+    scheduler = request.app.state.scheduler
+
+    try:
+        step_uuid = UUID(step_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid step_id")
+
+    # 🔍 find step across all processes
+    target_step = None
+    target_pid = None
+
+    for pid, steps in scheduler.steps.items():
+        for step in steps:
+            if step.step_id == step_uuid:
+                target_step = step
+                target_pid = pid
+                break
+        if target_step:
+            break
+
+    if not target_step:
+        raise HTTPException(status_code=404, detail="Step not found")
+
+    worker = scheduler._lease_worker_map.get(step_uuid)
+
+    # memory output
+    
+    process_memory = scheduler.memory_manager.read_process_memory(target_pid)
+    memory_output = (
+        process_memory.get(str(step_uuid))
+        or process_memory.get(step_uuid)
+    )
+
+    return {
+        "step_id": str(step_uuid),
+        "pid": str(target_pid),
+        "syscall": target_step.syscall,
+        "status": target_step.status.value,
+        "priority": target_step.priority,
+        "retries": target_step.retries,
+        "cost_estimate": target_step.cost_estimate,
+        "failure_policy": target_step.failure_policy,
+        "worker": worker,
+        "lease_active": worker is not None,
+        "output": memory_output,
+    }
+    
+
+@router.post("/steps/{step_id}/retry")
+def retry_step(step_id: str, request: Request):
+    scheduler = request.app.state.scheduler
+    step_uuid = UUID(step_id)
+
+    # find step
+    target_step = None
+    target_pid = None
+
+    for pid, steps in scheduler.steps.items():
+        for s in steps:
+            if s.step_id == step_uuid:
+                target_step = s
+                target_pid = pid
+                break
+
+    if not target_step:
+        raise HTTPException(status_code=404, detail="Step not found")
+
+    if target_step.status != StepStatus.FAILED:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Step not in FAILED state (current={target_step.status})",
+        )
+
+    # reset step
+    target_step.status = StepStatus.READY
+    target_step.retries += 1
+
+    scheduler.repo.save_step(target_step)
+
+    return {
+        "message": "Step requeued",
+        "step_id": step_id,
+        "retries": target_step.retries,
+        "pid": str(target_pid),
+    }
+
+
+@router.post("/processes/{pid}/cancel")
+def cancel_process(pid: UUID, request: Request):
+    scheduler = request.app.state.scheduler
+    ok = scheduler.cancel_process(pid)
+    if not ok:
+        raise HTTPException(status_code=404, detail="Process not found")
+
+    return {"status": "cancelled", "pid": str(pid)}
+
+
+def pause_process(self, pid: UUID):
+    process = self.processes.get(pid)
+    if not process:
+        return False
+
+    process.pause()
+    self.repo.save_process(process)
+
+    self.event_bus.publish(
+        Event(event_type="PROCESS_PAUSED", pid=pid)
+    )
+    return True
+
+
+def resume_process(self, pid: UUID):
+    process = self.processes.get(pid)
+    if not process:
+        return False
+
+    process.resume()
+    self.repo.save_process(process)
+
+    self.event_bus.publish(
+        Event(event_type="PROCESS_RESUMED", pid=pid)
+    )
+    return True

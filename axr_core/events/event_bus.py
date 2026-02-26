@@ -16,7 +16,7 @@ class EventBus:
         if self.repo:
             self.repo.save_event(event)
         
-        print(f"[EVENT] {event.event_type} pid= {event.pid} step= {event.step_id}")
+        print(f"[EVENT] {event.event_type} PID= {event.pid} STEP_ID= {event.step_id}")
     
     def get_events(self) -> List[Event]:
         return self._events

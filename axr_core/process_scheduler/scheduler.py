@@ -1,10 +1,10 @@
 from __future__ import annotations
-
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Dict, List
 from uuid import UUID
+import asyncio
 
 from axr_core.process_manager.process import AIProcess, ProcessState
 from axr_core.process_graph.models import ProcessStep, StepStatus
@@ -26,23 +26,17 @@ from axr_core.distributed.nats_client import NATSClient
 from axr_core.distributed.message import task_message
 from axr_core.reliability.lease_manager import LeaseManager
 from axr_core.distributed.worker_registry import WorkerRegistry
-import asyncio
-
 
 class ProcessScheduler:
-    """
-    AXR Kernel Process Scheduler (in-memory MVP)
-
-    Manages:
-    - active processes
-    - step resolution
-    - parallel execution
-    """
-
+    
     def __init__(self, max_workers: int = 4, poll_interval: float = 0.1):
         self.processes: Dict[UUID, AIProcess] = {}
         self.steps: Dict[UUID, List[ProcessStep]] = {}
-
+        self._process_rr_index = 0
+        self.global_max_parallel = max_workers
+        self._global_active_steps = 0
+        
+        
         self.executor = ThreadPoolExecutor(max_workers=max_workers)
         self.poll_interval = poll_interval
 
@@ -66,13 +60,17 @@ class ProcessScheduler:
         self.resource_manager = ResourceManager()
         self.lease_manager = LeaseManager(timeout_seconds=15)
         self.worker_registry = WorkerRegistry(ttl_seconds=10)
-        
-        self._rr_index = {}
+
         self._lease_worker_map: Dict[UUID, str] = {}
         
         self.max_parallel_per_process = 2
         self._active_steps_per_process: Dict[UUID, int] = {}
-
+        
+        self._retry_queue: Dict[UUID, float] = {}  # step_id -> next_retry_timestamp
+        self.MAX_RETRIES = 3
+        self.BASE_BACKOFF = 0.5
+        self._rr_index: Dict[str, int] = {}
+    
     #------------------------------
     # NATS Server
     # -----------------------------
@@ -87,6 +85,7 @@ class ProcessScheduler:
         await self.nats.subscribe("axr.heartbeat", cb=self._handle_heartbeat)
         print("[NATS] Scheduler connected and subscribed to axr.results")    
         
+    
     # ---------------------------
     # Kernel registration methods
     # ---------------------------
@@ -101,9 +100,11 @@ class ProcessScheduler:
             )
             
             self.repo.save_process(process)
-            
             for step in steps:
                 self.repo.save_step(step)
+
+            # 🔥 restore checkpoint state
+            self._restore_process_state(process)
 
     # ---------------------------
     # Kernel loop control
@@ -118,27 +119,59 @@ class ProcessScheduler:
     def stop(self) -> None:
         self._running = False
         self.executor.shutdown(wait=True)
-
+    
+    
     # ---------------------------
     # Core scheduling cycle
     # ---------------------------
 
     def _schedule_cycle(self) -> None:
+        
+        now = time.time()
+        ready_retry_steps = [
+            sid for sid, ts in self._retry_queue.items() if ts <= now
+        ]
+
+        for sid in ready_retry_steps:
+            for pid, steps in self.steps.items():
+                step = next((s for s in steps if s.step_id == sid), None)
+                if step and step.status == StepStatus.PENDING:
+                    print(f"[RETRY-READY] {step.syscall}")
+                    step.mark_ready()
+                    self.repo.save_step(step)
+
+            self._retry_queue.pop(sid, None)
+        
+        
         with self._lock:
             active_processes = [
-                p for p in self.processes.values() 
-                if p.is_active() and not getattr(p, "finalized", False)
+                p for p in self.processes.values()
+                if p.is_active()
+                and p.state != ProcessState.PAUSED
+                and not getattr(p, "finalized", False)
             ]
 
         futures = []
 
-        for process in active_processes:
-            print(f"[SCHED] Checking process {process.pid} state= {process.state}")
+        if not active_processes:
+            return
+
+        start_index = self._process_rr_index
+        count = len(active_processes)
+
+        for i in range(count):
+            process = active_processes[(start_index + i) % count]
             
+            if process.state == ProcessState.PAUSED:
+                continue
+
+            if process.state == ProcessState.FAILED:
+                continue
+            print(f"[SCHED] Checking process {process.pid} STATE= {process.state}")
+
             if process.state == ProcessState.READY:
                 process.start()
                 self._active_steps_per_process[process.pid] = 0
-                
 
                 self.event_bus.publish(
                     Event(event_type="PROCESS_STARTED", pid=process.pid)
@@ -147,38 +180,66 @@ class ProcessScheduler:
             steps = self.steps.get(process.pid, [])
             resolver = ProcessGraphResolver(steps)
             runnable_steps = resolver.resolve()
-            
+
             for s in runnable_steps:
                 if s.status == StepStatus.PENDING:
                     s.mark_ready()
-            
-            runnable_steps.sort(key=lambda s:s.priority)
+
+            runnable_steps.sort(key=lambda s: s.priority)
+
             if runnable_steps:
-                print(f"\n[RESOLVE] Runnable steps: {[s.syscall for s in runnable_steps]}")
+                print(f"[RESOLVE] Runnable steps: {[s.syscall for s in runnable_steps]}")
 
             for step in runnable_steps:
-                
+                if process.state == ProcessState.FAILED:
+                    break
+
+                if step.status != StepStatus.READY:
+                    continue
+
                 active = self._active_steps_per_process.get(process.pid, 0)
                 if active >= self.max_parallel_per_process:
                     print(f"[FAIR] Process {process.pid} hit parallel limit")
-                    
-                if step.status == StepStatus.RUNNING:
                     continue
-                    
-                if step.status != StepStatus.READY:
+
+                # 🔐 SECURITY CHECK (pre-schedule)
+                if not self.security_evaluator.allow(process, step):
+                    print(f"[SECURITY] Blocked {step.syscall} for PID={process.pid}")
+
+                    step.fail("Blocked by security policy")
+                    self.repo.save_step(step)
+
+                    self.event_bus.publish(
+                        Event(
+                            event_type="STEP_FAILED",
+                            pid=process.pid,
+                            step_id=step.step_id,
+                            metadata={"reason": "security_policy"},
+                        )
+                    )
+
+                    print(f"[SECURITY] {step.syscall} marked FAILED — process will finalize later")
+
+
                     continue
                 
-                # Resource admission control
+                # 🧠 RESOURCE CHECK
+                remaining_budget = process.remaining_budget()
+
                 if not self.resource_manager.can_schedule(
-                    process.pid,
-                    step.cost_estimate,
-                    process.remaining_budget(),
+                    process.pid, step.cost_estimate, remaining_budget
                 ):
-                    print(f"[RESOURCE] Blocked {step.syscall} (no slots/budget)")
+                    print(f"[RESOURCE] No slot for PID={process.pid}")
                     continue
+
+                # allocate AFTER approval
+                self.resource_manager.allocate(process.pid)
                 
-                print(f"[READY] {step.syscall}")
-                
+                if self._global_active_steps >= self.global_max_parallel:
+                    print("[GLOBAL-FAIR] Global parallel limit reached")
+                    break
+
+                # READY EVENT
                 self.event_bus.publish(
                     Event(
                         event_type="STEP_READY",
@@ -188,41 +249,38 @@ class ProcessScheduler:
                     )
                 )
                 
+                
+
                 step.start()
                 process.current_step_id = step.step_id
                 process.mark_scheduled()
-                
-                # Allocate resource slot
-                self.resource_manager.allocate(process.pid)
-                self._active_steps_per_process[process.pid] = active + 1
-                
-                print(
-                    f"[FAIR-DEBUG] pid= {process.pid}  active="
-                    f"{self._active_steps_per_process.get(process.pid, 0)}"
-                )
-                
-                with self._lock:
-                    self._active_steps_per_process[process.pid] = active + 1
-                
-                futures.append(
-                    self.executor.submit(self._execute_step, process, step)
-                )
-                # self._execute_step(process, step)
 
-        # # Wait for step execution to complete
+                with self._lock:
+                    self._active_steps_per_process[process.pid] = (
+                        self._active_steps_per_process.get(process.pid, 0) + 1
+                    )
+
+                print(
+                    f"[FAIR-DEBUG] pid={process.pid} active="
+                    f"{self._active_steps_per_process[process.pid]}"
+                )
+
+                futures.append(self.executor.submit(self._execute_step, process, step))
+                self._global_active_steps += 1
+                break  # ⬅️ important: only one step per process per cycle
+
         for future in as_completed(futures):
             pass
-        
-        self._check_expired_leases()
-        # Check process completion
+
         self._finalize_processes()
+        self._check_expired_leases()
+        self._process_rr_index = (start_index + 1) % count
 
     # ---------------------------
-    # Step execution
+    # Step execution (LOCAL SIMULATION)
     # ---------------------------
 
     def _execute_step(self, process: AIProcess, step: ProcessStep) -> None:
-        
         self.event_bus.publish(
             Event(
                 event_type="STEP_STARTED",
@@ -231,179 +289,83 @@ class ProcessScheduler:
                 metadata={"syscall": step.syscall},
             )
         )
+
         try:
             print(f"[EXEC] PID= {process.pid} STEP= {step.syscall}")
 
-            # Charge budget before dispatch
             process.charge_budget(step.cost_estimate)
             self.repo.save_process(process)
-            
-            process_memory = self.memory_manager.read_process_memory(process.pid)
-            
-            # Capability Issue
-            cap = self.capability_issuer.issue(
-                pid =process.pid,
-                step_id= step.step_id,
-                syscall=step.syscall,
-                budget_limit=step.cost_estimate
-            )
-            
-            print(f"[CAP] Issued cap_id= {cap.cap_id} syscall= {cap.syscall}")
-            
-            # JSON-safe: convert UUID keys -> str
-            json_safe_memory = {
-                str(k): v for k, v in process_memory.items()
-            }
-            
-            # Workers that support this tool
+
+            # 🔎 FIND WORKERS FOR TOOL
             workers = self.worker_registry.get_workers_for_tool(step.syscall)
-            
+
             if not workers:
                 print(f"[ROUTE] No workers available for {step.syscall}")
-                
-                step.status = StepStatus.READY
+
+                # schedule retry instead of immediate READY
+                self._schedule_retry(process, step, "no_workers")
+
                 self.resource_manager.release(process.pid)
-                
-                with self._lock:
-                    self._active_steps_per_process[process.pid] = max(0, self._active_steps_per_process[process.pid] -1)
+                self._decrement_active(process.pid)
+                self._global_active_steps = max(0, self._global_active_steps - 1)
+
                 return
-            
-            live_workers =  self.worker_registry.get_live_workers()
+
+            live_workers = self.worker_registry.get_live_workers()
             worker_load = self._get_worker_load()
-            
-            print(f"[ROUTE-DEBUG] live workers: {live_workers}")
-            print(f"[ROUTE-DEBUG] worker load: {worker_load}")
-            
-            # Capacity filtering
+
+            # 🧠 CAPACITY FILTER
             eligible = []
-            
             for wid in workers:
-                capacity = live_workers[wid].get("capacity",1)
+                capacity = live_workers[wid].get("capacity", 1)
                 active = worker_load.get(wid, 0)
-                
+
                 if active < capacity:
                     eligible.append(wid)
-            
+
             if not eligible:
                 print(f"[ROUTE] All workers at capacity for {step.syscall}")
-                step.status =  StepStatus.READY
-                
-                with self._lock:
-                    self._active_steps_per_process[process.pid] = max(0, self._active_steps_per_process[process.pid] -1)
+
+                step.status = StepStatus.READY
+                self.repo.save_step(step)
+
                 self.resource_manager.release(process.pid)
+                self._decrement_active(process.pid)
                 return
-            
+
+            # 🔁 ROUND ROBIN + LEAST LOAD
             rr = self._rr_index.get(step.syscall, 0)
-            
+
             scored = []
-            
             for i, w in enumerate(eligible):
-                load = worker_load.get(w,0)
+                load = worker_load.get(w, 0)
                 rr_offset = (i - rr) % len(eligible)
                 scored.append((w, load, rr_offset))
-            
+
             target_worker = min(scored, key=lambda x: (x[1], x[2]))[0]
-            
             self._rr_index[step.syscall] = (rr + 1) % len(eligible)
-            
-            # Dispatch task to NATS (instead of local execution)
-            payload = task_message(process, step, memory_inputs=json_safe_memory, capability=cap)
-            
-            print(f"[NATS-PUB] subject= axr.tasks.{target_worker} size= {len(payload)}")
-            
+
+            # 🛰️ DISPATCH TO NATS
+            payload = task_message(process, step, memory_inputs={}, capability=None)
+
+            print(
+                f"[NATS-PUB] subject= axr.tasks.{target_worker} size={len(payload)}"
+            )
+
             asyncio.run_coroutine_threadsafe(
-                self.nats.publish(f"axr.tasks.{target_worker}",payload),
+                self.nats.publish(f"axr.tasks.{target_worker}", payload),
                 self.loop,
             )
-            
-            
-            print(f"[ROUTE] {step.syscall} -> {target_worker}")
-            
+
+            print(f"[ROUTE] {step.syscall} -> Worker_ID: {target_worker}")
+
+            # ⏱️ START LEASE (for load tracking)
             self.lease_manager.start_lease(process.pid, step.step_id, target_worker)
             self._lease_worker_map[step.step_id] = target_worker
-            
-            
-        except PermissionError as e:
-            step.fail(str(e))
-            with self._lock:
-                self._active_steps_per_process[process.pid] = max(0, self._active_steps_per_process[process.pid] -1)
-            self.repo.save_step(step)
-            self.repo.save_process(process)
-
-            if step.failure_policy == "retry" and self.retry_manager.should_retry(step):
-                self.retry_manager.apply_backoff(step)
-                self.retry_manager.mark_retry(step, str(e))
-                print(f"[RETRY] Retrying {step.syscall}")
-                self.event_bus.publish(
-                    Event(
-                        event_type="STEP_RETRIED",
-                        pid=process.pid,
-                        step_id=step.step_id,
-                        metadata={"attempt": step.retries},
-                    )
-                )
-                return
-
-            if step.failure_policy == "skip":
-                step.status = StepStatus.SKIPPED
-                print(f"[SKIP] {step.syscall} skipped")
-                self.event_bus.publish(
-                    Event(
-                        event_type="STEP_SKIPPED",
-                        pid=process.pid,
-                        step_id=step.step_id,
-                        metadata={"attempt": step.retries},
-                    )
-                )
-                return
-
-            process.fail("Security violation")
-            print(f"[DENY] STEP={step.syscall}")
-            self.event_bus.publish(
-                Event(
-                    event_type="STEP_FAILED",
-                    pid=process.pid,
-                    step_id=step.step_id,
-                    metadata={"error": str(e)},
-                )
-            )
-            self.transaction_manager.rollback_process(process, self.steps[process.pid])
 
         except Exception as e:
             step.fail(str(e))
-            with self._lock:
-                self._active_steps_per_process[process.pid] = max(0, self._active_steps_per_process[process.pid] -1)
-            self.repo.save_step(step)
-            self.repo.save_process(process)
 
-            if step.failure_policy == "retry" and self.retry_manager.should_retry(step):
-                self.retry_manager.apply_backoff(step)
-                self.retry_manager.mark_retry(step, str(e))
-                print(f"[RETRY] Retrying {step.syscall}")
-                self.event_bus.publish(
-                    Event(
-                        event_type="STEP_RETRIED",
-                        pid=process.pid,
-                        step_id=step.step_id,
-                        metadata={"attempt": step.retries},
-                    )
-                )
-                return
-
-            if step.failure_policy == "skip":
-                step.status = StepStatus.SKIPPED
-                print(f"[SKIP] {step.syscall} skipped")
-                self.event_bus.publish(
-                    Event(
-                        event_type="STEP_SKIPPED",
-                        pid=process.pid,
-                        step_id=step.step_id,
-                        metadata={"attempt": step.retries},
-                    )
-                )
-                return
-
-            process.fail(str(e))
             self.event_bus.publish(
                 Event(
                     event_type="STEP_FAILED",
@@ -412,183 +374,218 @@ class ProcessScheduler:
                     metadata={"error": str(e)},
                 )
             )
-            print(f"[FAIL] STEP={step.syscall} ERROR={e}")
-            self.transaction_manager.rollback_process(process, self.steps[process.pid])
+
+            process.fail(str(e))
+            
+            for step in steps:
+                self.lease_manager.complete_lease(step.step_id)
+                self._lease_worker_map.pop(step.step_id, None)
+            
+            if step.failure_policy == "retry":
+                self._schedule_retry(process, step, str(e))
+                self.resource_manager.release(process.pid)
+
+                with self._lock:
+                    self._active_steps_per_process[process.pid] = max(
+                        0, self._active_steps_per_process[process.pid] - 1
+                    )
+                self._global_active_steps = max(0, self._global_active_steps - 1)
+                return
+
+        finally:
+            # ⚠️ DO NOT release resource here yet
+            # resource released when result comes (next phase)
+            self.repo.save_step(step)
+            self.repo.save_process(process)
+
     
+    # ---------------------------
+    # On Result
+    # ---------------------------
     
+    async def _on_result(self, msg):
+        import json
+
+        data = json.loads(msg.data.decode())
+
+        pid = UUID(data["pid"])
+        step_id = UUID(data["step_id"])
+
+        process = self.processes.get(pid)
+        steps = self.steps.get(pid, [])
+        step = next((s for s in steps if s.step_id == step_id), None)
+
+        if not process or not step:
+            return
+        
+        if process and process.state == ProcessState.FAILED:
+            print(f"[RESULT-IGNORED] Process {pid} already failed/cancelled")
+            return
+
+        # 🚫 Ignore results for failed/finalized process
+        if process.state == ProcessState.FAILED or getattr(process, "finalized", False):
+            print(f"[RESULT-IGNORED] Process {pid} already failed")
+            return
+
+        # ✅ COMPLETE LEASE
+        self.lease_manager.complete_lease(step_id)
+        self._lease_worker_map.pop(step_id, None)
+
+        # ✅ ACTIVE STEP COUNT--
+        self._decrement_active(pid)
+        
+        self._global_active_steps = max(0, self._global_active_steps - 1)
+
+        # ✅ RESOURCE RELEASE
+        self.resource_manager.release(pid)
+
+        # -------------------------
+        # SUCCESS
+        # -------------------------
+        if data["status"] == "success":
+            step.succeed()
+
+            if data.get("output"):
+                self.memory_manager.write_output(pid, step_id, data["output"])
+
+            self.event_bus.publish(
+                Event(
+                    event_type="STEP_SUCCEEDED",
+                    pid=pid,
+                    step_id=step_id,
+                )
+            )
+        # -------------------------
+        # FAILURE
+        # -------------------------
+        else:
+            error_msg = data.get("error", "Worker failure")
+
+            if step.failure_policy == "retry":
+                self._schedule_retry(process, step, error_msg)
+            elif step.failure_policy == "skip":
+                step.status = StepStatus.SKIPPED
+                self.event_bus.publish(
+                    Event(
+                        event_type="STEP_SKIPPED",
+                        pid=pid,
+                        step_id=step_id,
+                        metadata={"error": error_msg},
+                    )
+                )
+            else:
+                step.fail(error_msg)
+                self.event_bus.publish(
+                    Event(
+                        event_type="STEP_FAILED",
+                        pid=pid,
+                        step_id=step_id,
+                        metadata={"error": error_msg},
+                    )
+                )
+    
+    # ---------------------------
+    # Heartbeat Handler
+    # ---------------------------
+    
+    async def _handle_heartbeat(self, msg):
+        import json
+
+        data = json.loads(msg.data.decode())
+
+        worker_id = data["worker_id"]
+        tools = data["tools"]
+        capacity = data.get("capacity", 1)
+
+        self.worker_registry.register(worker_id, tools, capacity)
+
+        print(f"[HB] Worker {worker_id} tools={tools}")
+
+    # ---------------------------
+    # Active counter helper
+    # ---------------------------
+
+    def _decrement_active(self, pid: UUID):
+        with self._lock:
+            if pid in self._active_steps_per_process:
+                self._active_steps_per_process[pid] = max(
+                    0, self._active_steps_per_process[pid] - 1
+                )
+
+
     # ---------------------------
     # Process completion check
     # ---------------------------
 
-    def _finalize_processes(self) -> None:
+    def _finalize_processes(self):
         with self._lock:
             for pid, process in self.processes.items():
 
-                # Skip already finalized processes
                 if getattr(process, "finalized", False):
                     continue
 
                 steps = self.steps.get(pid, [])
-
                 if not steps:
                     continue
 
-                all_done = all(
-                    step.status in {StepStatus.SUCCESS, StepStatus.SKIPPED}
-                    for step in steps
-                )
-
                 any_failed = any(step.status == StepStatus.FAILED for step in steps)
+                any_skipped = any(step.status == StepStatus.SKIPPED for step in steps)
+                all_success = all(step.status == StepStatus.SUCCESS for step in steps)
+                # FAILURE (FAILED or SKIPPED → your rule)
+                if (any_failed or any_skipped) and process.state != ProcessState.FAILED:
+                    print(f"[PROCESS] {pid} transitioning to FAILED → triggering rollback")
 
-                # SUCCESS PATH
-                if all_done:
+                    # 🔥 mark process failed first
+                    process.fail("One or more steps failed/skipped")
+                    process.finalized = True
+                    self.repo.save_process(process)
+
+                    # 🔥 TRANSACTION ROLLBACK
+                    try:
+                        self.transaction_manager.rollback_process(process, steps)
+                    except Exception as e:
+                        print(f"[TXN-ERROR] Rollback failed for PID={pid}: {e}")
+
                     self.event_bus.publish(
-                        Event(
-                            event_type="PROCESS_SUCCEEDED",
-                            pid=process.pid,
-                        )
+                        Event(event_type="PROCESS_FAILED", pid=pid)
                     )
 
+                    self._active_steps_per_process.pop(pid, None)
+
+                    print(f"\n[PROCESS] {pid} finalized as FAILED\n")
+                    continue
+
+                # SUCCESS
+                if all_success:
                     process.terminate()
-                    process.finalized = True  # prevent re-emission
-                    self._active_steps_per_process.pop(process.pid, None)
-                    self.repo.save_process(process)
+                    process.finalized = True
 
-                    print(f"[PROCESS] {process.pid} finalized as SUCCEEDED")
-
-                # FAILURE PATH
-                elif any_failed and process.state != ProcessState.FAILED:
                     self.event_bus.publish(
-                        Event(
-                            event_type="PROCESS_FAILED",
-                            pid=process.pid,
-                        )
+                        Event(event_type="PROCESS_SUCCEEDED", pid=pid)
                     )
 
-                    process.fail("One or more steps failed")
-                    process.finalized = True  # prevent re-emission
-                    self._active_steps_per_process.pop(process.pid, None)
                     self.repo.save_process(process)
+                    self._active_steps_per_process.pop(pid, None)
 
-                    print(f"[PROCESS] {process.pid} finalized as FAILED")
+                    print(f"\n[PROCESS] {pid} finalized as SUCCEEDED\n")
                     
+    # -------------------------------
+    # Worker Load
+    # -------------------------------
     
-    def resume_process(self, process: AIProcess):
-        print(f"[RESUME] Restoring process {process.pid}")
-        
-        steps = self.steps.get(process.pid)
-        if not steps:
-            return
-        
-        self.checkpoint_manager.restore_checkpoint(process, steps)
-        
-        process.state =  ProcessState.RUNNING
-    
-    
-    async def _on_result(self, msg):
-        import json
-        from axr_core.capabilities.models import Capability
-        from datetime import datetime
-        
-        data = json.loads(msg.data.decode())
-        pid = UUID(data['pid'])
-        step_id = UUID(data['step_id'])
-        
-        process = self.processes.get(pid)
-        steps = self.steps.get(pid, [])
-        step = next((s for s in steps if s.step_id == step_id), None)
-        
-        if not step:
-            return
-        
-        cap_data = data.get("capability")
-        
-        print(f"[RESULT] capability present? {cap_data is not None}")
-        
-        if cap_data:
-           
-            cap = Capability(
-            cap_id=UUID(cap_data["cap_id"]),
-            pid=UUID(cap_data["pid"]),
-            step_id=UUID(cap_data["step_id"]),
-            syscall=cap_data["syscall"],
-            issued_at=datetime.fromisoformat(cap_data["issued_at"]),
-            expires_at=datetime.fromisoformat(cap_data["expires_at"]),
-            budget_limit=cap_data["budget_limit"],
-            signature=cap_data["signature"],
-            )
-            
-            
-            if not self.capability_validator.validate(cap):
-                print(f"[CAP] Invalid capability for step {data['step_id']}")
-                step.fail("Invalid capability")
-                self.repo.save_step(step)
-                return
-            else:
-                print(f"[CAP] Valid capability for step {data['step_id']}")
-        
-        else:
-            print(f"[CAP-ERROR] Missing capability for step {step_id}")
-            step.fail("Missing capability token")
-            self.repo.save_step(step)
-            self.repo.save_process(process)
-            self.resource_manager.release(pid)
-            return
-        
-        self.lease_manager.complete_lease(step_id)
-        self._lease_worker_map.pop(step_id, None)
-        
-        if pid in self._active_steps_per_process:
-            self._active_steps_per_process[pid] = max(
-                0, 
-                self._active_steps_per_process.get(pid, 0) -1
-            )
+    def _get_worker_load(self):
+        load = {}
 
-        if data['status'] == "success":
-            step.succeed()
-        
-            if data.get("output"):
-                self.memory_manager.write_output(pid, step_id, data["output"])
-            
-            
-            self.event_bus.publish(
-                Event(event_type="STEP_SUCCEEDED", pid=pid, step_id=step_id
-                      )
-            )
-        
-        else:
-            step.fail(data.get("error", "Worker failure"))
-            
-            self.event_bus.publish(
-                Event(
-                    event_type="STEP_FAILED",
-                    pid=pid,
-                    step_id=step_id,
-                    metadata={"error": data.get("error")},
-                )
-            )
-        
-        self.repo.save_step(step)
-        self.repo.save_process(process)
-        
-        self.resource_manager.release(pid)
-        print(f"[RESULT] RAW {msg.subject} {msg.data}")
-        
-    async def _handle_heartbeat(self, msg):
-        import json
-        
-        data = json.loads(msg.data.decode())
-        
-        worker_id = data["worker_id"]
-        tools = data["tools"]
-        capacity = data.get("capacity", 1)
-        
-        self.worker_registry.register(worker_id, tools, capacity)
-        
-        print(f"[HB] Woker {worker_id} tools= {tools}")
-        
-        
-        
+        for step_id, worker_id in self._lease_worker_map.items():
+            load[worker_id] = load.get(worker_id, 0) + 1
+
+        return load
+
+    
+    # -------------------------------
+    # Checking Expired Leases
+    # -------------------------------
+    
     def _check_expired_leases(self):
         expired = self.lease_manager.get_expired()
 
@@ -601,7 +598,6 @@ class ProcessScheduler:
             if not step:
                 continue
 
-            # mark step back to READY
             step.status = StepStatus.READY
             step.retries += 1
 
@@ -614,26 +610,178 @@ class ProcessScheduler:
                 )
             )
 
-            # release resource slot
             self.resource_manager.release(pid)
-
-            # remove old lease
             self.lease_manager.complete_lease(step_id)
-            
-            if pid in self._active_steps_per_process:
-                self._active_steps_per_process[pid] = max(
-                    0,
-                    self._active_steps_per_process[pid] - 1
-                )
-       
+            self._lease_worker_map.pop(step_id, None)
+            self._decrement_active(pid)
     
-    def _get_worker_load(self):
-        load = {}
+    
+    # --------------------------------
+    # Cancel Process
+    # --------------------------------
+    
+    def cancel_process(self, pid: UUID):
+        process = self.processes.get(pid)
+        if not process:
+            return False
+
+        steps = self.steps.get(pid, [])
+
+        print(f"[CANCEL] Cancelling process {pid}")
+
+        # mark process failed
+        process.fail("Cancelled by user")
+        process.finalized = True
+        self.repo.save_process(process)
+
+        # fail running steps + clear leases
+        for step in steps:
+            if step.status == StepStatus.RUNNING:
+                step.fail("Cancelled")
+
+            self.lease_manager.complete_lease(step.step_id)
+            self._lease_worker_map.pop(step.step_id, None)
+            self.repo.save_step(step)
+
+        # release resources
+        self.resource_manager.release(pid)
+        self._active_steps_per_process.pop(pid, None)
+
+        # emit event
+        self.event_bus.publish(
+            Event(event_type="PROCESS_CANCELLED", pid=pid)
+        )
+
+        return True
+    
+    
+    # --------------------------------
+    # Pause Process
+    # --------------------------------
+    
+    def pause_process(self, pid: UUID):
+        process = self.processes.get(pid)
+        if not process:
+            return False
+
+        if process.state == ProcessState.PAUSED:
+            return True
+
+        process.pause()
+        self.repo.save_process(process)
+
+        self.event_bus.publish(
+            Event(event_type="PROCESS_PAUSED", pid=pid)
+        )
+
+        print(f"[PAUSE] Process {pid} paused")
+        return True
+    
+    # --------------------------------
+    # Resume Process
+    # --------------------------------
+    
+    def resume_process(self, pid: UUID):
+        process = self.processes.get(pid)
+        if not process:
+            return False
+
+        if process.state != ProcessState.PAUSED:
+            return True
+
+        process.state = ProcessState.READY
+        self.repo.save_process(process)
+
+        self.event_bus.publish(
+            Event(event_type="PROCESS_RESUMED", pid=pid)
+        )
+
+        print(f"[RESUME] Process {pid} resumed")
+        return True
+    
+    
+    # ----------------------------------
+    # Helper: Scheduler Retry
+    # ----------------------------------
+    
+    def _schedule_retry(self, process: AIProcess, step: ProcessStep, reason: str):
+        if step.retries >= self.MAX_RETRIES:
+            print(f"[DEAD] Step {step.syscall} exceeded retries")
+            step.fail("Max retries exceeded")
+            self.repo.save_step(step)
+
+            self.event_bus.publish(
+                Event(
+                    event_type="STEP_DEAD",
+                    pid=process.pid,
+                    step_id=step.step_id,
+                    metadata={"reason": reason},
+                )
+            )
+            return
+
+        step.retries += 1
+        backoff = self.BASE_BACKOFF * (2 ** (step.retries - 1))
+        retry_time = time.time() + backoff
+
+        self._retry_queue[step.step_id] = retry_time
+        step.status = StepStatus.PENDING
+        self.repo.save_step(step)
+
+        print(f"[RETRY] {step.syscall} retry={step.retries} in {backoff:.2f}s")
+
+        self.event_bus.publish(
+            Event(
+                event_type="STEP_RETRY_SCHEDULED",
+                pid=process.pid,
+                step_id=step.step_id,
+                metadata={"retry": step.retries, "backoff": backoff},
+            )
+        )
+    
+    
+    # ------------------------------
+    # Restore Method
+    # ------------------------------
+    
+    def _restore_process_state(self, process: AIProcess):
+        steps = self.steps.get(process.pid, [])
+        if not steps:
+            return
+
+        print(f"[RESTORE] Process {process.pid}")
+
+        for step in steps:
+            if step.status == StepStatus.RUNNING:
+                # was in-flight → retry
+                step.status = StepStatus.PENDING
+                print(f"[RESTORE] {step.syscall} RUNNING → PENDING")
+
+        self.checkpoint_manager.restore_checkpoint(process, steps)
+        print(f"[RESTORE] Memory restored for {process.pid}")
         
-        for step_id, worker_id in self._lease_worker_map.items():
-            load[worker_id] = load.get(worker_id, 0) + 1
-        
-        return load
+        any_failed = any(s.status == StepStatus.FAILED for s in steps)
+        all_done = all(
+            s.status in {StepStatus.SUCCESS, StepStatus.SKIPPED} for s in steps
+        )
+
+        if any_failed:
+            process.fail("Restored with failed step")
+        elif all_done:
+            process.terminate()
+            process.finalized = True
+        else:
+            process.state = ProcessState.RUNNING
+
+        self.repo.save_process(process)
+        for step in steps:
+            self.repo.save_step(step)
+            
+        self._active_steps_per_process[process.pid] = 0
+        self._global_active_steps = 0
+        # 🔥 reset resource usage for restored process
+        self.resource_manager.reset_usage(process.pid)
+    
     
     
     def run_once(self) -> None:
@@ -641,6 +789,3 @@ class ProcessScheduler:
         Run ad single scheduling cycle (for testing).
         """
         self._schedule_cycle()
-
-
-    

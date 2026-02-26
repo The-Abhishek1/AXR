@@ -29,7 +29,7 @@ class TransactionManager:
         print(f"\n[TXN] Starting rollback for PID= {process.pid}")
         
         successful_steps = [
-            step for step in steps if step.status == StepStatus.SUCCESS
+            step for step in steps if step.status in { StepStatus.SUCCESS , StepStatus.RUNNING} 
         ]
         
         # Reverse order for rollback
@@ -38,7 +38,7 @@ class TransactionManager:
             try:
                 tool = self.registry.get_tool(step.syscall)
                 
-                print(f"\n[TXN] Rolling back {step.syscall}")
+                print(f"\n[TXN] Rolling back {step.syscall} STEP_ID: {step.step_id}")
                 
                 tool.rollback(process, step, self.memory_manager)
                 
@@ -56,8 +56,9 @@ class TransactionManager:
                 
                 # Clean memory for that step
                 self.memory_manager.write_output(process.pid, step.step_id, None)
+                print(f"[TXN] Rolling complete for {step.syscall} STEP_ID: {step.step_id}")
             
             except Exception as e:
-                print(f"[TXN-FAIL] Rollback failed for {step.syscall}: {e}")
+                print(f"\n[TXN-FAIL] Rollback failed for {step.syscall}: {e}\n")
             
-        print(f"[TXN] Rollback complete for PID= {process.pid}")
+        print(f"\n[TXN] Rollback complete for PID= {process.pid}\n")

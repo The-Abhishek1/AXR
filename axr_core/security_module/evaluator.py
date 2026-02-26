@@ -39,13 +39,11 @@ class SecurityEvaluator:
     def allow(self, process: AIProcess, step: ProcessStep) -> bool:
         syscall = step.syscall
         
-        # 1. Deny list check (highest priority)
-        denied = self.policy.get("denied_syscalls", [])
+        denied = self.policy.get("denied_syscalls") or []
         if syscall in denied:
             return False
 
-        # 2. Allow list check
-        allowed = self.policy.get("allowed_syscalls", [])
+        allowed = self.policy.get("allowed_syscalls") or []
         if allowed and syscall not in allowed:
             return False
         
