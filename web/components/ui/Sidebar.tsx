@@ -86,7 +86,7 @@ export default function Sidebar() {
     },
     {
       name: 'Analytics',
-      href: '/analytics',
+      href: '/analytics/costs',
       icon: BarChart3,
       color: 'text-pink-400',
       bgColor: 'bg-pink-500/10',
