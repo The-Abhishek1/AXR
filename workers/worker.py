@@ -79,7 +79,7 @@ async def main():
 
     # heartbeat after subscribe
     async def send_heartbeat():
-        WORKER_CAPACITY = 2
+        WORKER_CAPACITY = 10
         while True:
             await nc.publish(
                 "axr.heartbeat",

@@ -135,7 +135,7 @@ def get_step_detail(step_id: str, request: Request):
     }
     
 
-@router.post("/steps/{step_id}/retry")
+@router.get("/steps/{step_id}/retry")
 def retry_step(step_id: str, request: Request):
     scheduler = request.app.state.scheduler
     step_uuid = UUID(step_id)
@@ -174,7 +174,7 @@ def retry_step(step_id: str, request: Request):
     }
 
 
-@router.post("/processes/{pid}/cancel")
+@router.get("/processes/{pid}/cancel")
 def cancel_process(pid: UUID, request: Request):
     scheduler = request.app.state.scheduler
     ok = scheduler.cancel_process(pid)
@@ -183,22 +183,42 @@ def cancel_process(pid: UUID, request: Request):
 
     return {"status": "cancelled", "pid": str(pid)}
 
-@router.post("/processes/{pid}/pause")
+@router.get("/processes/{pid}/pause")
 def pause_process(pid: UUID, request: Request):
     scheduler = request.app.state.scheduler
-    ok = scheduler.pause_process(pid)
-    if not ok:
+
+    process = scheduler.processes.get(pid)
+    if not process:
         raise HTTPException(status_code=404, detail="Process not found")
+
+    if getattr(process, "finalized", False):
+        raise HTTPException(status_code=400, detail="Process already finalized")
+
+    ok = scheduler.pause_process(pid)
+
+    if not ok:
+        raise HTTPException(status_code=400, detail="Pause failed")
 
     return {"status": "paused", "pid": str(pid)}
 
 
-@router.post("/processes/{pid}/resume")
+@router.get("/processes/{pid}/resume")
 def resume_process(pid: UUID, request: Request):
     scheduler = request.app.state.scheduler
-    ok = scheduler.resume_process(pid)
-    if not ok:
+
+    process = scheduler.processes.get(pid)
+    if not process:
         raise HTTPException(status_code=404, detail="Process not found")
 
-    return {"status": "resumed", "pid": str(pid)}
+    if process.state == "FAILED":
+        raise HTTPException(status_code=400, detail="Cannot resume failed process")
 
+    if getattr(process, "finalized", False):
+        raise HTTPException(status_code=400, detail="Process already finalized")
+
+    ok = scheduler.resume_process(pid)
+
+    if not ok:
+        raise HTTPException(status_code=400, detail="Resume failed")
+
+    return {"status": "resumed", "pid": str(pid)}

@@ -58,7 +58,7 @@ class ProcessScheduler:
         self.checkpoint_manager = CheckpointManager(self.memory_manager)
         self.retry_manager = RetryManager()
         self.resource_manager = ResourceManager()
-        self.lease_manager = LeaseManager(timeout_seconds=1500000)
+        self.lease_manager = LeaseManager(timeout_seconds=15)
         self.worker_registry = WorkerRegistry(ttl_seconds=10)
 
         self._lease_worker_map: Dict[UUID, str] = {}
