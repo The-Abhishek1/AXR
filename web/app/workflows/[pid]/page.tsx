@@ -1,157 +1,124 @@
 // app/workflows/[pid]/page.tsx
 'use client';
 
-import { useEffect, useState, Suspense } from 'react';
-import { useParams } from 'next/navigation';
-import dynamic from 'next/dynamic';
-import { motion, AnimatePresence } from 'framer-motion';
-import { getProcesses } from '@/lib/api';
-import { mapStepsToGraph } from '@/lib/graph-mapper';
-import StatusBadge from '@/components/ui/StatusBadge';
-import BudgetBar from '@/components/ui/BudgetBar';
-import { Card, CardContent } from '@/components/ui/card';
-import { Badge } from '@/components/ui/badge';
-import { 
-  PlayCircle, 
-  PauseCircle, 
-  StopCircle, 
-  RotateCcw, 
+import { useEffect, useState } from 'react';
+import { useParams, useRouter } from 'next/navigation';
+import { motion } from 'framer-motion';
+import Link from 'next/link';
+import {
+  ArrowLeft,
+  PlayCircle,
+  PauseCircle,
+  StopCircle,
   RefreshCw,
   Clock,
   Layers,
   DollarSign,
   AlertCircle,
-  Activity
+  CheckCircle,
+  XCircle,
+  GitBranch,
+  Shield,
+  Zap,
+  Download,
+  Trash2
 } from 'lucide-react';
-import Skeleton from 'react-loading-skeleton';
-import 'react-loading-skeleton/dist/skeleton.css';
-import axios from 'axios';
+import { Card, CardContent } from '@/components/ui/card';
+import { Badge } from '@/components/ui/badge';
+import { Button } from '@/components/ui/button';
+import { api, Process, StepDetail } from '@/lib/api';
+import { cn, formatDate } from '@/lib/utils';
+import WorkflowGraph from '@/components/graph/WorkflowGraph';
+import { mapStepsToGraph } from '@/lib/graph-mapper';
 import toast from 'react-hot-toast';
-import { cn } from '@/lib/utils';
-
-// Import Resizable components directly (not dynamically)
-import { 
-  ResizablePanelGroup, 
-  ResizablePanel, 
-  ResizableHandle 
-} from '@/components/ui/resizable';
-
-// Dynamic imports with proper loading states
-const WorkflowGraph = dynamic(
-  () => import('@/components/graph/WorkflowGraph'),
-  { 
-    ssr: false,
-    loading: () => (
-      <div className="w-full h-full bg-zinc-900 rounded-xl animate-pulse flex items-center justify-center">
-        <Activity className="w-8 h-8 text-zinc-700 animate-spin" />
-      </div>
-    )
-  }
-);
-
-const StepDetailsPanel = dynamic(
-  () => import('@/components/graph/StepDetailsPanel'),
-  { 
-    ssr: false,
-    loading: () => (
-      <Card className="h-full">
-        <CardContent className="p-6 flex items-center justify-center h-full">
-          <Activity className="w-6 h-6 text-zinc-700 animate-spin" />
-        </CardContent>
-      </Card>
-    )
-  }
-);
 
 export default function WorkflowDetailPage() {
   const params = useParams();
+  const router = useRouter();
   const pid = params.pid as string;
 
+  const [process, setProcess] = useState<Process | null>(null);
+  const [steps, setSteps] = useState<StepDetail[]>([]);
   const [nodes, setNodes] = useState<any[]>([]);
   const [edges, setEdges] = useState<any[]>([]);
-  const [steps, setSteps] = useState<any[]>([]);
-  const [selectedStep, setSelectedStep] = useState<any>(null);
-  const [process, setProcess] = useState<any>(null);
+  const [selectedStep, setSelectedStep] = useState<StepDetail | null>(null);
   const [loading, setLoading] = useState(true);
-  const [isRefreshing, setIsRefreshing] = useState(false);
+  const [refreshing, setRefreshing] = useState(false);
+  const [activeTab, setActiveTab] = useState<'overview' | 'steps' | 'logs'>('overview');
 
   useEffect(() => {
-    let interval: NodeJS.Timeout;
-
-    async function fetchData() {
-      try {
-        const data = await getProcesses();
-        const proc = data.processes.find(
-          (p: any) => p.pid === decodeURIComponent(pid)
-        );
-
-        if (!proc) return;
-
-        setProcess(proc);
-        setSteps(proc.steps);
-
-        const { nodes, edges } = mapStepsToGraph(proc.steps);
-        setNodes(nodes);
-        setEdges(edges);
-      } catch (error) {
-        console.error('Failed to fetch process data');
-        toast.error('Failed to fetch process data');
-      } finally {
-        setLoading(false);
-        setIsRefreshing(false);
-      }
-    }
-
-    fetchData();
-    interval = setInterval(fetchData, 5000);
-
+    fetchProcess();
+    const interval = setInterval(fetchProcess, 3000);
     return () => clearInterval(interval);
   }, [pid]);
 
-  const handleProcessAction = async (action: 'pause' | 'resume' | 'cancel') => {
+  const fetchProcess = async () => {
     try {
-      setIsRefreshing(true);
-      const endpoint = `http://127.0.0.1:8000/process/${pid}/${action}`;
-      const response = await axios.post(endpoint);
+      const data = await api.getProcess(pid);
+      setProcess(data);
       
-      if (response.status === 200) {
-        toast.success(`Process ${action}ed successfully`);
-        
-        // Refresh data
-        const data = await getProcesses();
-        const proc = data.processes.find((p: any) => p.pid === pid);
-        setProcess(proc);
-      }
+      // Fetch step details for each step
+      const stepDetails = await Promise.all(
+        data.steps.map(async (step: any) => {
+          try {
+            return await api.getStep(step.step_id);
+          } catch {
+            return step;
+          }
+        })
+      );
+      setSteps(stepDetails);
+      
+      const { nodes, edges } = mapStepsToGraph(stepDetails);
+      setNodes(nodes);
+      setEdges(edges);
+    } catch (error) {
+      toast.error('Failed to fetch process details');
+    } finally {
+      setLoading(false);
+      setRefreshing(false);
+    }
+  };
+
+  const handleAction = async (action: 'pause' | 'resume' | 'cancel') => {
+    try {
+      setRefreshing(true);
+      let result;
+      if (action === 'pause') result = await api.pauseProcess(pid);
+      if (action === 'resume') result = await api.resumeProcess(pid);
+      if (action === 'cancel') result = await api.cancelProcess(pid);
+      
+      toast.success(`Process ${action}ed successfully`);
+      await fetchProcess();
     } catch (error) {
       toast.error(`Failed to ${action} process`);
     } finally {
-      setIsRefreshing(false);
+      setRefreshing(false);
     }
   };
 
   const handleNodeClick = (_: any, node: any) => {
-    const step = steps.find((s) => s.step_id === node.id);
-    setSelectedStep(step);
+    const step = steps.find(s => s.step_id === node.id);
+    setSelectedStep(step || null);
   };
 
-  const getStatusColor = (status: string): string => {
-    const colors: Record<string, string> = {
-      RUNNING: 'bg-blue-500',
-      TERMINATED: 'bg-emerald-500',
-      FAILED: 'bg-red-500',
-      PENDING: 'bg-yellow-500',
-      PAUSED: 'bg-orange-500',
-      SUCCESS: 'bg-emerald-500',
-    };
-    return colors[status] || 'bg-zinc-500';
+  const handleExportLogs = () => {
+    // Mock export - in real app, this would call an API
+    const data = JSON.stringify({ process, steps }, null, 2);
+    const blob = new Blob([data], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `workflow-${pid}.json`;
+    a.click();
   };
 
   if (loading) {
     return (
       <div className="p-6 space-y-4">
-        <Skeleton height={80} className="bg-zinc-800" />
-        <Skeleton height={120} className="bg-zinc-800" />
-        <Skeleton height={500} className="bg-zinc-800" />
+        <div className="h-8 w-48 bg-slate-800 rounded-lg animate-pulse" />
+        <div className="h-32 bg-slate-800 rounded-lg animate-pulse" />
+        <div className="h-96 bg-slate-800 rounded-lg animate-pulse" />
       </div>
     );
   }
@@ -159,11 +126,15 @@ export default function WorkflowDetailPage() {
   if (!process) {
     return (
       <div className="p-6 flex items-center justify-center h-full">
-        <Card className="max-w-md">
+        <Card className="bg-slate-900/50 border-indigo-500/20 max-w-md">
           <CardContent className="p-8 text-center">
-            <AlertCircle className="w-12 h-12 text-red-400 mx-auto mb-4" />
-            <h2 className="text-xl font-bold mb-2">Process Not Found</h2>
-            <p className="text-zinc-400">The requested process could not be found.</p>
+            <AlertCircle className="w-12 h-12 text-rose-400 mx-auto mb-4" />
+            <h2 className="text-xl font-bold text-white mb-2">Process Not Found</h2>
+            <p className="text-zinc-400 mb-4">The requested process could not be found.</p>
+            <Button onClick={() => router.push('/workflows')}>
+              <ArrowLeft className="w-4 h-4 mr-2" />
+              Back to Workflows
+            </Button>
           </CardContent>
         </Card>
       </div>
@@ -171,169 +142,346 @@ export default function WorkflowDetailPage() {
   }
 
   return (
-    <div className="p-6 h-full">
-      <ResizablePanelGroup direction="horizontal" className="h-full gap-3">
-        {/* Left Panel */}
-        <ResizablePanel defaultSize={70} minSize={50}>
-          <div className="pr-2 space-y-4 h-full overflow-auto scrollbar-thin scrollbar-thumb-zinc-800">
-            {/* Process Header */}
-            <motion.div
-              initial={{ opacity: 0, y: -20 }}
-              animate={{ opacity: 1, y: 0 }}
-            >
-              <Card className="overflow-hidden border-0 bg-gradient-to-br from-zinc-900 to-zinc-950">
-                <div className="absolute inset-0 bg-gradient-to-r from-emerald-500/5 via-transparent to-blue-500/5" />
-                <CardContent className="p-6 relative">
-                  <div className="flex items-start justify-between mb-4">
-                    <div>
-                      <div className="flex items-center gap-3 mb-2">
-                        <h1 className="text-xl font-mono text-white bg-zinc-800/50 px-3 py-1 rounded-lg">
-                          {process.pid.slice(0, 8)}...{process.pid.slice(-4)}
-                        </h1>
-                        <StatusBadge status={process.state} />
-                      </div>
-                      <div className="flex items-center gap-4 text-sm text-zinc-400">
-                        <span className="flex items-center gap-1">
-                          <Clock className="w-3 h-3" />
-                          {new Date().toLocaleString()}
-                        </span>
-                        <span>•</span>
-                        <span className="flex items-center gap-1">
-                          <Layers className="w-3 h-3" />
-                          {process.steps.length} steps
-                        </span>
-                      </div>
-                    </div>
-                    
-                    {/* Process Controls */}
-                    <div className="flex items-center gap-2">
-                      <AnimatePresence mode="wait">
-                        {process.state === 'RUNNING' && (
-                          <motion.div
-                            key="running-controls"
-                            initial={{ opacity: 0, scale: 0.9 }}
-                            animate={{ opacity: 1, scale: 1 }}
-                            exit={{ opacity: 0, scale: 0.9 }}
-                            className="flex gap-2"
-                          >
-                            <button
-                              onClick={() => handleProcessAction('pause')}
-                              className="p-2 rounded-lg bg-yellow-500/20 hover:bg-yellow-500/30 transition-all group relative overflow-hidden"
-                              title="Pause Process"
-                            >
-                              <div className="absolute inset-0 bg-gradient-to-r from-yellow-500/0 via-yellow-500/20 to-yellow-500/0 translate-x-[-100%] group-hover:translate-x-[100%] transition-transform duration-1000" />
-                              <PauseCircle className="w-5 h-5 text-yellow-400 group-hover:scale-110 transition-transform" />
-                            </button>
-                            <button
-                              onClick={() => handleProcessAction('cancel')}
-                              className="p-2 rounded-lg bg-red-500/20 hover:bg-red-500/30 transition-all group relative overflow-hidden"
-                              title="Cancel Process"
-                            >
-                              <div className="absolute inset-0 bg-gradient-to-r from-red-500/0 via-red-500/20 to-red-500/0 translate-x-[-100%] group-hover:translate-x-[100%] transition-transform duration-1000" />
-                              <StopCircle className="w-5 h-5 text-red-400 group-hover:scale-110 transition-transform" />
-                            </button>
-                          </motion.div>
-                        )}
-                        {process.state === 'PAUSED' && (
-                          <motion.div
-                            key="paused-controls"
-                            initial={{ opacity: 0, scale: 0.9 }}
-                            animate={{ opacity: 1, scale: 1 }}
-                            exit={{ opacity: 0, scale: 0.9 }}
-                          >
-                            <button
-                              onClick={() => handleProcessAction('resume')}
-                              className="p-2 rounded-lg bg-emerald-500/20 hover:bg-emerald-500/30 transition-all group relative overflow-hidden"
-                              title="Resume Process"
-                            >
-                              <div className="absolute inset-0 bg-gradient-to-r from-emerald-500/0 via-emerald-500/20 to-emerald-500/0 translate-x-[-100%] group-hover:translate-x-[100%] transition-transform duration-1000" />
-                              <PlayCircle className="w-5 h-5 text-emerald-400 group-hover:scale-110 transition-transform" />
-                            </button>
-                          </motion.div>
-                        )}
-                      </AnimatePresence>
-                      <button
-                        onClick={() => {
-                          setIsRefreshing(true);
-                          window.location.reload();
-                        }}
-                        disabled={isRefreshing}
-                        className="p-2 rounded-lg bg-zinc-800 hover:bg-zinc-700 transition-colors group relative overflow-hidden"
-                        title="Refresh"
-                      >
-                        <RefreshCw className={`w-5 h-5 ${isRefreshing ? 'animate-spin' : 'group-hover:rotate-180 transition-transform duration-500'}`} />
-                      </button>
-                    </div>
-                  </div>
+    <div className="p-4 lg:p-6 space-y-6 max-w-7xl mx-auto">
+      {/* Back Navigation */}
+      <motion.div
+        initial={{ opacity: 0, x: -20 }}
+        animate={{ opacity: 1, x: 0 }}
+        className="flex items-center gap-2"
+      >
+        <button
+          onClick={() => router.back()}
+          className="p-2 rounded-lg hover:bg-indigo-500/10 transition-colors"
+        >
+          <ArrowLeft className="w-5 h-5 text-indigo-400" />
+        </button>
+        <span className="text-zinc-400">/</span>
+        <Link href="/workflows" className="text-sm text-zinc-400 hover:text-indigo-400 transition-colors">
+          Workflows
+        </Link>
+        <span className="text-zinc-400">/</span>
+        <span className="text-sm text-white font-mono">{pid.slice(0, 8)}...</span>
+      </motion.div>
 
-                  <BudgetBar used={process.budget_used} limit={process.budget_limit} />
-                </CardContent>
-              </Card>
-            </motion.div>
+      {/* Header */}
+      <motion.div
+        initial={{ opacity: 0, y: -20 }}
+        animate={{ opacity: 1, y: 0 }}
+        className="flex flex-col lg:flex-row lg:items-center justify-between gap-4"
+      >
+        <div>
+          <div className="flex items-center gap-3 mb-2">
+            <h1 className="text-2xl lg:text-3xl font-bold gradient-text-primary">
+              Workflow Details
+            </h1>
+            <Badge variant={getStatusVariant(process.state)} className="text-sm">
+              {process.state}
+            </Badge>
+          </div>
+          <p className="text-sm text-zinc-400 font-mono">{pid}</p>
+        </div>
 
-            {/* Metrics Grid */}
-            <motion.div
-              initial={{ opacity: 0, y: -20 }}
-              animate={{ opacity: 1, y: 0 }}
-              transition={{ delay: 0.1 }}
-              className="grid grid-cols-3 gap-4"
+        <div className="flex items-center gap-3">
+          {/* Process Controls */}
+          {process.state === 'RUNNING' && (
+            <>
+              <Button
+                variant="outline"
+                onClick={() => handleAction('pause')}
+                className="border-amber-500/30 text-amber-400 hover:bg-amber-500/10"
+              >
+                <PauseCircle className="w-4 h-4 mr-2" />
+                Pause
+              </Button>
+              <Button
+                variant="outline"
+                onClick={() => handleAction('cancel')}
+                className="border-rose-500/30 text-rose-400 hover:bg-rose-500/10"
+              >
+                <StopCircle className="w-4 h-4 mr-2" />
+                Cancel
+              </Button>
+            </>
+          )}
+          
+          {process.state === 'PAUSED' && (
+            <Button
+              variant="outline"
+              onClick={() => handleAction('resume')}
+              className="border-emerald-500/30 text-emerald-400 hover:bg-emerald-500/10"
             >
-              {[
-                { label: 'Total Steps', value: process.steps.length, icon: Layers, color: 'text-blue-400' },
-                { label: 'Budget Used', value: process.budget_used, icon: DollarSign, color: 'text-emerald-400' },
-                { label: 'Budget Limit', value: process.budget_limit, icon: AlertCircle, color: 'text-purple-400' },
-              ].map((metric, idx) => {
-                const Icon = metric.icon;
-                return (
-                  <motion.div
-                    key={metric.label}
-                    initial={{ opacity: 0, y: 20 }}
-                    animate={{ opacity: 1, y: 0 }}
-                    transition={{ delay: 0.1 + idx * 0.05 }}
-                  >
-                    <Card className="hover:shadow-lg hover:shadow-emerald-500/5 transition-all duration-300">
-                      <CardContent className="p-4">
-                        <div className="flex items-center justify-between">
-                          <div>
-                            <p className="text-xs text-zinc-400">{metric.label}</p>
-                            <p className={`text-2xl font-bold ${metric.color}`}>{metric.value}</p>
-                          </div>
-                          <div className={`p-3 rounded-xl bg-zinc-800/50 ${metric.color}`}>
-                            <Icon className="w-5 h-5" />
-                          </div>
-                        </div>
-                      </CardContent>
-                    </Card>
-                  </motion.div>
-                );
-              })}
-            </motion.div>
+              <PlayCircle className="w-4 h-4 mr-2" />
+              Resume
+            </Button>
+          )}
 
-            {/* Graph */}
-            <motion.div
-              initial={{ opacity: 0 }}
-              animate={{ opacity: 1 }}
-              transition={{ delay: 0.2 }}
-              className="h-[500px] rounded-xl overflow-hidden shadow-2xl"
+          <Button
+            variant="outline"
+            onClick={handleExportLogs}
+            className="border-indigo-500/30 text-indigo-400 hover:bg-indigo-500/10"
+          >
+            <Download className="w-4 h-4 mr-2" />
+            Export
+          </Button>
+
+          <button
+            onClick={() => {
+              setRefreshing(true);
+              fetchProcess();
+            }}
+            disabled={refreshing}
+            className="p-2 rounded-lg hover:bg-indigo-500/10 transition-colors"
+          >
+            <RefreshCw className={cn('w-5 h-5 text-indigo-400', refreshing && 'animate-spin')} />
+          </button>
+        </div>
+      </motion.div>
+
+      {/* Overview Cards */}
+      <motion.div
+        initial={{ opacity: 0, y: 20 }}
+        animate={{ opacity: 1, y: 0 }}
+        transition={{ delay: 0.1 }}
+        className="grid grid-cols-2 lg:grid-cols-4 gap-3 lg:gap-4"
+      >
+        <Card className="bg-slate-900/50 border-indigo-500/20">
+          <CardContent className="p-4">
+            <div className="flex items-center gap-3">
+              <div className="p-2 rounded-lg bg-indigo-500/10">
+                <Layers className="w-4 h-4 text-indigo-400" />
+              </div>
+              <div>
+                <p className="text-xs text-zinc-400">Total Steps</p>
+                <p className="text-xl font-bold text-white">{process.steps.length}</p>
+              </div>
+            </div>
+          </CardContent>
+        </Card>
+
+        <Card className="bg-slate-900/50 border-emerald-500/20">
+          <CardContent className="p-4">
+            <div className="flex items-center gap-3">
+              <div className="p-2 rounded-lg bg-emerald-500/10">
+                <CheckCircle className="w-4 h-4 text-emerald-400" />
+              </div>
+              <div>
+                <p className="text-xs text-zinc-400">Completed</p>
+                <p className="text-xl font-bold text-emerald-400">
+                  {steps.filter(s => s.status === 'SUCCESS').length}
+                </p>
+              </div>
+            </div>
+          </CardContent>
+        </Card>
+
+        <Card className="bg-slate-900/50 border-amber-500/20">
+          <CardContent className="p-4">
+            <div className="flex items-center gap-3">
+              <div className="p-2 rounded-lg bg-amber-500/10">
+                <Clock className="w-4 h-4 text-amber-400" />
+              </div>
+              <div>
+                <p className="text-xs text-zinc-400">Running</p>
+                <p className="text-xl font-bold text-amber-400">
+                  {steps.filter(s => s.status === 'RUNNING').length}
+                </p>
+              </div>
+            </div>
+          </CardContent>
+        </Card>
+
+        <Card className="bg-slate-900/50 border-rose-500/20">
+          <CardContent className="p-4">
+            <div className="flex items-center gap-3">
+              <div className="p-2 rounded-lg bg-rose-500/10">
+                <XCircle className="w-4 h-4 text-rose-400" />
+              </div>
+              <div>
+                <p className="text-xs text-zinc-400">Failed</p>
+                <p className="text-xl font-bold text-rose-400">
+                  {steps.filter(s => s.status === 'FAILED').length}
+                </p>
+              </div>
+            </div>
+          </CardContent>
+        </Card>
+      </motion.div>
+
+      {/* Budget Bar */}
+      <motion.div
+        initial={{ opacity: 0, y: 20 }}
+        animate={{ opacity: 1, y: 0 }}
+        transition={{ delay: 0.2 }}
+      >
+        <Card className="bg-slate-900/50 border-indigo-500/20">
+          <CardContent className="p-4 lg:p-6">
+            <div className="flex items-center justify-between mb-2">
+              <span className="text-sm text-zinc-400">Budget Usage</span>
+              <span className="text-sm font-medium text-white">
+                {process.budget_used} / {process.budget_limit}
+              </span>
+            </div>
+            <div className="w-full h-2 bg-slate-800 rounded-full overflow-hidden">
+              <div
+                className="h-full bg-gradient-to-r from-indigo-500 to-purple-500 rounded-full"
+                style={{ width: `${(process.budget_used / process.budget_limit) * 100}%` }}
+              />
+            </div>
+          </CardContent>
+        </Card>
+      </motion.div>
+
+      {/* Tabs */}
+      <motion.div
+        initial={{ opacity: 0, y: 20 }}
+        animate={{ opacity: 1, y: 0 }}
+        transition={{ delay: 0.3 }}
+        className="border-b border-indigo-500/20"
+      >
+        <div className="flex gap-6">
+          {['overview', 'steps', 'logs'].map((tab) => (
+            <button
+              key={tab}
+              onClick={() => setActiveTab(tab as any)}
+              className={cn(
+                'pb-3 text-sm font-medium capitalize transition-colors relative',
+                activeTab === tab
+                  ? 'text-indigo-400'
+                  : 'text-zinc-400 hover:text-white'
+              )}
             >
+              {tab}
+              {activeTab === tab && (
+                <motion.div
+                  layoutId="activeTab"
+                  className="absolute bottom-0 left-0 right-0 h-0.5 bg-gradient-to-r from-indigo-500 to-purple-500"
+                />
+              )}
+            </button>
+          ))}
+        </div>
+      </motion.div>
+
+      {/* Tab Content */}
+      <motion.div
+        key={activeTab}
+        initial={{ opacity: 0, x: 20 }}
+        animate={{ opacity: 1, x: 0 }}
+        transition={{ duration: 0.2 }}
+      >
+        {activeTab === 'overview' && (
+          <div className="grid lg:grid-cols-3 gap-6">
+            {/* Graph - Takes 2 columns */}
+            <div className="lg:col-span-2 h-[500px] bg-slate-900/30 rounded-lg border border-indigo-500/20 overflow-hidden">
               <WorkflowGraph
                 nodes={nodes}
                 edges={edges}
                 onNodeClick={handleNodeClick}
               />
-            </motion.div>
-          </div>
-        </ResizablePanel>
+            </div>
 
-        <ResizableHandle withHandle />
-
-        {/* Right Panel */}
-        <ResizablePanel defaultSize={30} minSize={20}>
-          <div className="pl-2 h-full">
-            <StepDetailsPanel step={selectedStep} stepList={steps} />
+            {/* Step Details - Takes 1 column */}
+            <Card className="bg-slate-900/50 border-indigo-500/20">
+              <CardContent className="p-4 lg:p-6">
+                {selectedStep ? (
+                  <div className="space-y-4">
+                    <h3 className="font-semibold text-white">Step Details</h3>
+                    <div className="space-y-3">
+                      <div className="p-3 bg-slate-800/50 rounded-lg">
+                        <p className="text-xs text-zinc-400">Step ID</p>
+                        <p className="text-sm font-mono text-white">{selectedStep.step_id.slice(0, 8)}...</p>
+                      </div>
+                      <div className="p-3 bg-slate-800/50 rounded-lg">
+                        <p className="text-xs text-zinc-400">Syscall</p>
+                        <p className="text-sm text-indigo-400">{selectedStep.syscall}</p>
+                      </div>
+                      <div className="p-3 bg-slate-800/50 rounded-lg">
+                        <p className="text-xs text-zinc-400">Status</p>
+                        <Badge variant={getStatusVariant(selectedStep.status)}>
+                          {selectedStep.status}
+                        </Badge>
+                      </div>
+                      {selectedStep.worker && (
+                        <div className="p-3 bg-slate-800/50 rounded-lg">
+                          <p className="text-xs text-zinc-400">Worker</p>
+                          <p className="text-sm text-white">{selectedStep.worker}</p>
+                        </div>
+                      )}
+                      {selectedStep.output && (
+                        <div className="p-3 bg-slate-800/50 rounded-lg">
+                          <p className="text-xs text-zinc-400 mb-2">Output</p>
+                          <pre className="text-xs bg-slate-900 p-2 rounded overflow-auto max-h-32">
+                            {JSON.stringify(selectedStep.output, null, 2)}
+                          </pre>
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                ) : (
+                  <div className="text-center py-8">
+                    <GitBranch className="w-8 h-8 text-zinc-600 mx-auto mb-2" />
+                    <p className="text-sm text-zinc-400">Click on a step to view details</p>
+                  </div>
+                )}
+              </CardContent>
+            </Card>
           </div>
-        </ResizablePanel>
-      </ResizablePanelGroup>
+        )}
+
+        {activeTab === 'steps' && (
+          <Card className="bg-slate-900/50 border-indigo-500/20">
+            <CardContent className="p-4 lg:p-6">
+              <div className="space-y-2">
+                {steps.map((step, idx) => (
+                  <motion.div
+                    key={step.step_id}
+                    initial={{ opacity: 0, x: -20 }}
+                    animate={{ opacity: 1, x: 0 }}
+                    transition={{ delay: idx * 0.05 }}
+                    className="flex items-center justify-between p-3 rounded-lg bg-slate-800/30 hover:bg-slate-800/50 transition-colors cursor-pointer"
+                    onClick={() => setSelectedStep(step)}
+                  >
+                    <div className="flex items-center gap-3">
+                      <div className={cn('w-2 h-2 rounded-full', getStatusColor(step.status))} />
+                      <span className="text-sm font-mono text-white">{step.syscall}</span>
+                      {step.retries ? <Badge variant="outline" className="text-xs">Retry {step.retries}</Badge> : null}
+                    </div>
+                    <div className="flex items-center gap-3">
+                      <span className="text-xs text-zinc-400">Priority {step.priority}</span>
+                      <Badge variant={getStatusVariant(step.status)}>{step.status}</Badge>
+                    </div>
+                  </motion.div>
+                ))}
+              </div>
+            </CardContent>
+          </Card>
+        )}
+
+        {activeTab === 'logs' && (
+          <Card className="bg-slate-900/50 border-indigo-500/20">
+            <CardContent className="p-4 lg:p-6">
+              <div className="font-mono text-xs space-y-1 bg-slate-950 p-4 rounded-lg overflow-auto max-h-96">
+                <p className="text-zinc-400">[2024-01-01 12:00:00] Process started</p>
+                <p className="text-emerald-400">[2024-01-01 12:00:01] Step git.clone completed</p>
+                <p className="text-emerald-400">[2024-01-01 12:00:02] Step sast.scan completed</p>
+                <p className="text-emerald-400">[2024-01-01 12:00:03] Step lint completed</p>
+                <p className="text-emerald-400">[2024-01-01 12:00:04] Step deploy.service completed</p>
+                <p className="text-emerald-400">[2024-01-01 12:00:05] Process terminated successfully</p>
+              </div>
+            </CardContent>
+          </Card>
+        )}
+      </motion.div>
     </div>
   );
+}
+
+function getStatusVariant(status: string): any {
+  const variants: Record<string, any> = {
+    RUNNING: 'info',
+    SUCCESS: 'success',
+    FAILED: 'destructive',
+    PENDING: 'warning',
+  };
+  return variants[status] || 'default';
 }

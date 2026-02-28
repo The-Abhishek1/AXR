@@ -1,5 +1,6 @@
 from typing import Dict
 from uuid import UUID
+import threading
 
 from axr_core.resource_manager.resource_model import ProcessResources
 
@@ -14,59 +15,72 @@ class ResourceManager:
     def __init__(self):
         self.process_limits: Dict[UUID, ProcessResources] = {}
         self.active_steps: Dict[UUID, int] = {}
+        self._lock = threading.RLock()
 
     # ------------------------------
     # Register process limits
     # ------------------------------
 
     def register_process(self, pid: UUID, limits: ProcessResources):
-        self.process_limits[pid] = limits
-        self.active_steps[pid] = 0
+        with self._lock:
+            self.process_limits[pid] = limits
+            self.active_steps[pid] = 0
 
     # ------------------------------
     # Admission control
     # ------------------------------
 
     def can_schedule(self, pid: UUID, step_cost: float, remaining_budget: float) -> bool:
-        limits = self.process_limits.get(pid)
+        with self._lock:
+            limits = self.process_limits.get(pid)
 
-        if not limits:
+            if not limits:
+                return True
+
+            # concurrency check
+            if self.active_steps.get(pid, 0) >= limits.max_concurrent_steps:
+                return False
+
+            # budget check
+            if step_cost > remaining_budget:
+                return False
+
             return True
-
-        # concurrency check
-        if self.active_steps.get(pid, 0) >= limits.max_concurrent_steps:
-            return False
-
-        # budget check
-        if step_cost > remaining_budget:
-            return False
-
-        return True
 
     # ----------------------------------
     # Allocate slot
     # ----------------------------------
 
     def allocate(self, pid: UUID) -> bool:
-        limits = self.process_limits.get(pid)
+        with self._lock:
+            limits = self.process_limits.get(pid)
 
-        if not limits:
+            if not limits:
+                self.active_steps[pid] = self.active_steps.get(pid, 0) + 1
+                return True
+
+            if self.active_steps.get(pid, 0) >= limits.max_concurrent_steps:
+                return False
+
             self.active_steps[pid] = self.active_steps.get(pid, 0) + 1
             return True
-
-        if self.active_steps.get(pid, 0) >= limits.max_concurrent_steps:
-            return False
-
-        self.active_steps[pid] = self.active_steps.get(pid, 0) + 1
-        return True
 
     # ----------------------------------
     # Release slot
     # ----------------------------------
 
     def release(self, pid: UUID):
-        if self.active_steps.get(pid, 0) > 0:
-            self.active_steps[pid] -= 1
+        with self._lock:
+            if pid in self.active_steps and self.active_steps[pid] > 0:
+                self.active_steps[pid] -= 1
+
+    # ----------------------------------
+    # Get current active steps
+    # ----------------------------------
+
+    def get_active_steps(self, pid: UUID) -> int:
+        with self._lock:
+            return self.active_steps.get(pid, 0)
 
     # ----------------------------------
     # Reset usage (FOR RESTORE / HEAL)
@@ -77,5 +91,6 @@ class ResourceManager:
         Force reset active slot usage for a process.
         Used during crash recovery / restore.
         """
-        if pid in self.active_steps:
-            self.active_steps[pid] = 0
+        with self._lock:
+            if pid in self.active_steps:
+                self.active_steps[pid] = 0

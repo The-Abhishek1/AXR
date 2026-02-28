@@ -26,6 +26,7 @@ class ProcessStep:
     
     step_id: UUID = field(default_factory=uuid4)
     status: StepStatus = StepStatus.PENDING
+    assigned_worker: Optional[str] = None
     
     # Dependency management
     depends_on: List[UUID] = field(default_factory=list)

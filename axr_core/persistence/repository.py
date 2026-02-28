@@ -27,6 +27,7 @@ class PersistenceRepository:
                 syscall=step.syscall,
                 status=str(step.status),
                 retries=step.retries,
+                assigned_worker= step.assigned_worker
             )
             db.merge(db_step)
             db.commit()

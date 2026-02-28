@@ -4,7 +4,9 @@ allowed_syscalls:
   - lint
   - deploy.service 
 
+
 denied_syscalls:
+
   
 budget_limits:
   max_per_process: 100

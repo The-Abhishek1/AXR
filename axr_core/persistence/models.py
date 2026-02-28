@@ -23,6 +23,7 @@ class StepDB(Base):
     syscall = Column(String)
     status = Column(String)
     retries = Column(Integer, default=0)
+    assigned_worker = Column(String)
     
 class EventDB(Base):
     __tablename__ = "events"

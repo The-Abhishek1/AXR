@@ -1,11 +1,12 @@
+# api/routes/replay.py
 from fastapi import APIRouter, Request
 from uuid import UUID
 
-router = APIRouter()
+router = APIRouter(tags=["replay"])
 
-
-@router.post("/{pid}")
+@router.post("/replay/{pid}")
 def replay_process(pid: UUID, request: Request):
+    """Replay a process"""
     scheduler = request.app.state.scheduler
 
     process = scheduler.processes.get(pid)

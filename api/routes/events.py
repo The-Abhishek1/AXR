@@ -1,3 +1,4 @@
+# api/routes/events.py
 from fastapi import APIRouter
 from uuid import UUID
 from fastapi.responses import StreamingResponse
@@ -7,10 +8,12 @@ import json
 from api.deps.db import SessionLocal
 from axr_core.persistence.models import EventDB
 
-router = APIRouter()
+# Create router instance FIRST
+router = APIRouter(tags=["events"])
 
-@router.get("/{pid}")
+@router.get("/events/{pid}")
 def get_events(pid: UUID):
+    """Get events for a specific process"""
     db = SessionLocal()
     try:
         rows = (
@@ -20,7 +23,7 @@ def get_events(pid: UUID):
             .all()
         )
         
-        return[
+        return [
             {
                 "event_type": r.event_type,
                 "step_id": r.step_id,
@@ -29,11 +32,11 @@ def get_events(pid: UUID):
             }
             for r in rows
         ]
-    
     finally:
         db.close()
 
 def event_stream(pid):
+    """Generator for event streaming"""
     db = SessionLocal()
     last_id = None
     
@@ -48,15 +51,15 @@ def event_stream(pid):
 
             for r in rows:
                 last_id = r.id
-                
-                yield f"data: {json.dumps({'event_type': r.event_type,'step_id': str(r.step_id) if r.step_id else None,'timestamp': r.timestamp.isoformat(),'metadata': r.meta_data,})}\n\n"
+                yield f"data: {json.dumps({'event_type': r.event_type,'step_id': str(r.step_id) if r.step_id else None,'timestamp': r.timestamp.isoformat(),'metadata': r.meta_data})}\n\n"
             
             time.sleep(0.5)
     finally:
         db.close()
-        
-@router.get("/stream/{pid}")
+
+@router.get("/events/stream/{pid}")
 def stream_events(pid: UUID):
+    """Stream events for a specific process"""
     return StreamingResponse(
         event_stream(pid),
         media_type="text/event-stream",

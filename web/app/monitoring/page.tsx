@@ -1,44 +1,62 @@
 // app/monitoring/page.tsx
 'use client';
 
-import { useState, useEffect } from 'react';
+import { useEffect, useState } from 'react';
 import { motion } from 'framer-motion';
+import Link from 'next/link';
+import {
+  Activity,
+  Bell,
+  AlertCircle,
+  CheckCircle,
+  XCircle,
+  Clock,
+  TrendingUp,
+  BarChart3,
+  PieChart,
+  LineChart,
+  Gauge,
+  Server,
+  Cpu,
+  HardDrive,
+  Network,
+  Zap,
+  Eye,
+  EyeOff,
+  Download,
+  RefreshCw,
+  Calendar,
+  Filter
+} from 'lucide-react';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
-import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
+import { Badge } from '@/components/ui/badge';
+import { Button } from '@/components/ui/button';
+import { api } from '@/lib/api';
+import { cn } from '@/lib/utils';
 import {
   AreaChart,
   Area,
   BarChart,
   Bar,
-  PieChart,
+  PieChart as RePieChart,
   Pie,
   Cell,
-  LineChart,
+  LineChart as ReLineChart,
   Line,
   ResponsiveContainer,
-  Tooltip,
-  Legend,
   XAxis,
   YAxis,
-  CartesianGrid,
+  Tooltip,
+  Legend,
+  RadarChart,
+  Radar,
+  PolarGrid,
+  PolarAngleAxis,
+  PolarRadiusAxis
 } from 'recharts';
-import { 
-  Activity, 
-  TrendingUp, 
-  PieChart as PieChartIcon, 
-  BarChart2,
-  Cpu,
-  Memory,
-  Network,
-  Server,
-  AlertCircle,
-  CheckCircle,
-  Clock
-} from 'lucide-react';
-import { theme } from '@/lib/theme';
-import { cn } from '@/lib/utils';
+import toast from 'react-hot-toast';
 
-// Mock data - replace with real API data
+// Mock data for charts
 const systemMetrics = [
   { time: '00:00', cpu: 45, memory: 60, network: 30, processes: 12 },
   { time: '04:00', cpu: 52, memory: 65, network: 45, processes: 18 },
@@ -49,11 +67,11 @@ const systemMetrics = [
 ];
 
 const stepStatusData = [
-  { name: 'Success', value: 1245, color: theme.colors.success },
-  { name: 'Running', value: 342, color: theme.colors.info },
-  { name: 'Failed', value: 123, color: theme.colors.destructive },
-  { name: 'Pending', value: 567, color: theme.colors.muted },
-  { name: 'Retry', value: 89, color: theme.colors.warning },
+  { name: 'Success', value: 1245, color: '#10b981' },
+  { name: 'Running', value: 342, color: '#6366f1' },
+  { name: 'Failed', value: 123, color: '#ef4444' },
+  { name: 'Pending', value: 567, color: '#f59e0b' },
+  { name: 'Retry', value: 89, color: '#8b5cf6' },
 ];
 
 const topTools = [
@@ -62,20 +80,38 @@ const topTools = [
   { name: 'lint', executions: 298, success: 95, time: 123 },
   { name: 'deploy.service', executions: 245, success: 88, time: 892 },
   { name: 'test.run', executions: 189, success: 91, time: 345 },
-  { name: 'build.image', executions: 156, success: 94, time: 678 },
 ];
 
-const agentMetrics = [
-  { name: 'agent-1', load: 45, capacity: 100, status: 'healthy' },
-  { name: 'agent-2', load: 78, capacity: 100, status: 'warning' },
-  { name: 'agent-3', load: 23, capacity: 100, status: 'healthy' },
-  { name: 'agent-4', load: 92, capacity: 100, status: 'critical' },
-  { name: 'agent-5', load: 34, capacity: 100, status: 'healthy' },
+const alerts = [
+  { id: 1, severity: 'critical', message: 'Worker agent-3 has high latency', time: '2 min ago', status: 'active' },
+  { id: 2, severity: 'warning', message: 'Process budget exceeded for workflow f8c3...', time: '15 min ago', status: 'active' },
+  { id: 3, severity: 'info', message: 'New agent registered: agent-11', time: '1 hour ago', status: 'resolved' },
+  { id: 4, severity: 'critical', message: 'Step deploy.service failed repeatedly', time: '2 hours ago', status: 'active' },
+  { id: 5, severity: 'warning', message: 'High memory usage on worker agent-7', time: '3 hours ago', status: 'resolved' },
 ];
 
 export default function MonitoringPage() {
   const [timeRange, setTimeRange] = useState('24h');
+  const [autoRefresh, setAutoRefresh] = useState(true);
   const [selectedMetric, setSelectedMetric] = useState('cpu');
+  const [showResolved, setShowResolved] = useState(false);
+  const [stats, setStats] = useState({
+    systemHealth: 98.5,
+    activeAlerts: alerts.filter(a => a.status === 'active').length,
+    totalExecutions: 2345,
+    avgResponseTime: 234,
+  });
+
+  const filteredAlerts = alerts.filter(a => showResolved || a.status === 'active');
+
+  const getSeverityColor = (severity: string) => {
+    switch(severity) {
+      case 'critical': return 'text-rose-400 bg-rose-500/10 border-rose-500/20';
+      case 'warning': return 'text-amber-400 bg-amber-500/10 border-amber-500/20';
+      case 'info': return 'text-blue-400 bg-blue-500/10 border-blue-500/20';
+      default: return 'text-zinc-400 bg-zinc-500/10 border-zinc-500/20';
+    }
+  };
 
   const container = {
     hidden: { opacity: 0 },
@@ -93,33 +129,55 @@ export default function MonitoringPage() {
   };
 
   return (
-    <div className="p-6 space-y-6 max-w-7xl mx-auto">
+    <div className="p-4 lg:p-6 space-y-6 max-w-7xl mx-auto">
       {/* Header */}
       <motion.div
         initial={{ opacity: 0, y: -20 }}
         animate={{ opacity: 1, y: 0 }}
-        className="flex items-center justify-between"
+        className="flex flex-col lg:flex-row lg:items-center justify-between gap-4"
       >
         <div>
-          <h1 className="text-4xl font-bold bg-gradient-to-r from-emerald-400 via-blue-400 to-purple-400 bg-clip-text text-transparent">
-            Monitoring
+          <h1 className="text-3xl lg:text-4xl font-bold">
+            <span className="gradient-text-primary">Monitoring</span>
           </h1>
-          <p className="text-zinc-400 mt-2">Real-time system metrics and analytics</p>
+          <p className="text-zinc-400 mt-1 text-sm lg:text-base">
+            Real-time system metrics and analytics
+          </p>
         </div>
+
         <div className="flex items-center gap-3">
+          <div className="flex items-center gap-1 p-1 bg-slate-900/50 rounded-lg border border-indigo-500/20">
+            <button
+              onClick={() => setAutoRefresh(!autoRefresh)}
+              className={cn(
+                'p-2 rounded transition-colors flex items-center gap-2',
+                autoRefresh
+                  ? 'bg-indigo-500/20 text-indigo-400'
+                  : 'text-zinc-400 hover:text-indigo-400'
+              )}
+            >
+              {autoRefresh ? <Eye className="w-4 h-4" /> : <EyeOff className="w-4 h-4" />}
+              <span className="text-xs hidden lg:inline">Auto-refresh</span>
+            </button>
+          </div>
+
           <select
             value={timeRange}
             onChange={(e) => setTimeRange(e.target.value)}
-            className="px-3 py-2 bg-zinc-900 border border-zinc-800 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-emerald-500/50"
+            className="px-3 py-2 bg-slate-900 border border-indigo-500/20 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500/50"
           >
             <option value="1h">Last Hour</option>
             <option value="24h">Last 24 Hours</option>
             <option value="7d">Last 7 Days</option>
             <option value="30d">Last 30 Days</option>
           </select>
-          <div className="px-3 py-2 bg-emerald-500/10 border border-emerald-500/30 rounded-lg">
-            <span className="text-emerald-400 text-sm font-medium">Live</span>
-          </div>
+
+          <button
+            onClick={() => toast.success('Data refreshed')}
+            className="p-2 rounded-lg hover:bg-indigo-500/10 transition-colors"
+          >
+            <RefreshCw className="w-5 h-5 text-indigo-400" />
+          </button>
         </div>
       </motion.div>
 
@@ -128,48 +186,74 @@ export default function MonitoringPage() {
         variants={container}
         initial="hidden"
         animate="show"
-        className="grid gap-6 md:grid-cols-4"
+        className="grid grid-cols-2 lg:grid-cols-4 gap-3 lg:gap-4"
       >
-        {[
-          { label: 'System Health', value: '98.5%', icon: Server, color: 'text-emerald-400', bg: 'bg-emerald-500/10' },
-          { label: 'Avg Response', value: '234ms', icon: Clock, color: 'text-blue-400', bg: 'bg-blue-500/10' },
-          { label: 'Active Alerts', value: '3', icon: AlertCircle, color: 'text-yellow-400', bg: 'bg-yellow-500/10' },
-          { label: 'Uptime', value: '99.9%', icon: CheckCircle, color: 'text-purple-400', bg: 'bg-purple-500/10' },
-        ].map((stat) => {
-          const Icon = stat.icon;
-          return (
-            <motion.div key={stat.label} variants={item}>
-              <Card className="group hover:shadow-lg hover:shadow-emerald-500/5 transition-all">
-                <CardContent className="p-6">
-                  <div className="flex items-center gap-4">
-                    <div className={cn('p-3 rounded-xl', stat.bg)}>
-                      <Icon className={cn('w-6 h-6', stat.color)} />
-                    </div>
-                    <div>
-                      <p className="text-sm text-zinc-400">{stat.label}</p>
-                      <p className="text-2xl font-bold text-white">{stat.value}</p>
-                    </div>
-                  </div>
-                </CardContent>
-              </Card>
-            </motion.div>
-          );
-        })}
+        <Card className="bg-slate-900/50 border-indigo-500/20">
+          <CardContent className="p-4">
+            <div className="flex items-center gap-3">
+              <div className="p-2 rounded-lg bg-emerald-500/10">
+                <Activity className="w-5 h-5 text-emerald-400" />
+              </div>
+              <div>
+                <p className="text-xs text-zinc-400">System Health</p>
+                <p className="text-xl font-bold text-emerald-400">{stats.systemHealth}%</p>
+              </div>
+            </div>
+          </CardContent>
+        </Card>
+
+        <Card className="bg-slate-900/50 border-indigo-500/20">
+          <CardContent className="p-4">
+            <div className="flex items-center gap-3">
+              <div className="p-2 rounded-lg bg-rose-500/10">
+                <Bell className="w-5 h-5 text-rose-400" />
+              </div>
+              <div>
+                <p className="text-xs text-zinc-400">Active Alerts</p>
+                <p className="text-xl font-bold text-rose-400">{stats.activeAlerts}</p>
+              </div>
+            </div>
+          </CardContent>
+        </Card>
+
+        <Card className="bg-slate-900/50 border-indigo-500/20">
+          <CardContent className="p-4">
+            <div className="flex items-center gap-3">
+              <div className="p-2 rounded-lg bg-indigo-500/10">
+                <Zap className="w-5 h-5 text-indigo-400" />
+              </div>
+              <div>
+                <p className="text-xs text-zinc-400">Total Executions</p>
+                <p className="text-xl font-bold text-indigo-400">{stats.totalExecutions}</p>
+              </div>
+            </div>
+          </CardContent>
+        </Card>
+
+        <Card className="bg-slate-900/50 border-indigo-500/20">
+          <CardContent className="p-4">
+            <div className="flex items-center gap-3">
+              <div className="p-2 rounded-lg bg-amber-500/10">
+                <Clock className="w-5 h-5 text-amber-400" />
+              </div>
+              <div>
+                <p className="text-xs text-zinc-400">Avg Response</p>
+                <p className="text-xl font-bold text-amber-400">{stats.avgResponseTime}ms</p>
+              </div>
+            </div>
+          </CardContent>
+        </Card>
       </motion.div>
 
-      {/* Main Charts */}
-      <div className="grid gap-6 lg:grid-cols-2">
+      {/* Main Charts Grid */}
+      <div className="grid lg:grid-cols-2 gap-6">
         {/* System Performance */}
-        <motion.div
-          initial={{ opacity: 0, x: -20 }}
-          animate={{ opacity: 1, x: 0 }}
-          transition={{ delay: 0.2 }}
-        >
-          <Card>
+        <motion.div variants={item}>
+          <Card className="bg-slate-900/50 border-indigo-500/20">
             <CardHeader>
               <div className="flex items-center justify-between">
-                <CardTitle className="text-lg flex items-center gap-2">
-                  <Activity className="w-5 h-5 text-emerald-400" />
+                <CardTitle className="text-white flex items-center gap-2">
+                  <Activity className="w-5 h-5 text-indigo-400" />
                   System Performance
                 </CardTitle>
                 <div className="flex items-center gap-2">
@@ -178,10 +262,10 @@ export default function MonitoringPage() {
                       key={metric}
                       onClick={() => setSelectedMetric(metric)}
                       className={cn(
-                        'px-3 py-1 text-xs rounded-lg capitalize transition-all',
+                        'px-2 py-1 text-xs rounded-lg capitalize transition-all',
                         selectedMetric === metric
-                          ? 'bg-emerald-500/20 text-emerald-400 border border-emerald-500/30'
-                          : 'bg-zinc-800 text-zinc-400 hover:bg-zinc-700'
+                          ? 'bg-indigo-500/20 text-indigo-400 border border-indigo-500/30'
+                          : 'bg-slate-800 text-zinc-400 hover:bg-slate-700'
                       )}
                     >
                       {metric}
@@ -191,43 +275,30 @@ export default function MonitoringPage() {
               </div>
             </CardHeader>
             <CardContent>
-              <div className="h-80 w-full">
+              <div className="h-64">
                 <ResponsiveContainer width="100%" height="100%">
                   <AreaChart data={systemMetrics}>
                     <defs>
-                      <linearGradient id="colorCpu" x1="0" y1="0" x2="0" y2="1">
-                        <stop offset="5%" stopColor="#10b981" stopOpacity={0.3} />
-                        <stop offset="95%" stopColor="#10b981" stopOpacity={0} />
-                      </linearGradient>
-                      <linearGradient id="colorMemory" x1="0" y1="0" x2="0" y2="1">
-                        <stop offset="5%" stopColor="#3b82f6" stopOpacity={0.3} />
-                        <stop offset="95%" stopColor="#3b82f6" stopOpacity={0} />
-                      </linearGradient>
-                      <linearGradient id="colorNetwork" x1="0" y1="0" x2="0" y2="1">
-                        <stop offset="5%" stopColor="#f59e0b" stopOpacity={0.3} />
-                        <stop offset="95%" stopColor="#f59e0b" stopOpacity={0} />
+                      <linearGradient id="colorMetric" x1="0" y1="0" x2="0" y2="1">
+                        <stop offset="5%" stopColor="#6366f1" stopOpacity={0.3} />
+                        <stop offset="95%" stopColor="#6366f1" stopOpacity={0} />
                       </linearGradient>
                     </defs>
-                    <CartesianGrid strokeDasharray="3 3" stroke="#27272a" />
                     <XAxis dataKey="time" stroke="#71717a" />
                     <YAxis stroke="#71717a" />
                     <Tooltip
                       contentStyle={{
-                        backgroundColor: theme.colors.card,
-                        border: `1px solid ${theme.colors.border}`,
+                        backgroundColor: '#0f172a',
+                        border: '1px solid #6366f1',
                         borderRadius: '8px',
-                        color: theme.colors.foreground,
                       }}
                     />
                     <Area
                       type="monotone"
                       dataKey={selectedMetric}
-                      stroke={
-                        selectedMetric === 'cpu' ? '#10b981' :
-                        selectedMetric === 'memory' ? '#3b82f6' : '#f59e0b'
-                      }
+                      stroke="#6366f1"
                       strokeWidth={2}
-                      fill={`url(#color${selectedMetric.charAt(0).toUpperCase() + selectedMetric.slice(1)})`}
+                      fill="url(#colorMetric)"
                     />
                   </AreaChart>
                 </ResponsiveContainer>
@@ -237,28 +308,24 @@ export default function MonitoringPage() {
         </motion.div>
 
         {/* Step Status Distribution */}
-        <motion.div
-          initial={{ opacity: 0, x: 20 }}
-          animate={{ opacity: 1, x: 0 }}
-          transition={{ delay: 0.3 }}
-        >
-          <Card>
+        <motion.div variants={item}>
+          <Card className="bg-slate-900/50 border-indigo-500/20">
             <CardHeader>
-              <CardTitle className="text-lg flex items-center gap-2">
-                <PieChartIcon className="w-5 h-5 text-purple-400" />
+              <CardTitle className="text-white flex items-center gap-2">
+                <PieChart className="w-5 h-5 text-indigo-400" />
                 Step Status Distribution
               </CardTitle>
             </CardHeader>
             <CardContent>
-              <div className="h-80 w-full">
+              <div className="h-64">
                 <ResponsiveContainer width="100%" height="100%">
-                  <PieChart>
+                  <RePieChart>
                     <Pie
                       data={stepStatusData}
                       cx="50%"
                       cy="50%"
                       innerRadius={60}
-                      outerRadius={100}
+                      outerRadius={80}
                       paddingAngle={5}
                       dataKey="value"
                       label={({ name, percent }) => `${name} ${(percent * 100).toFixed(0)}%`}
@@ -269,12 +336,12 @@ export default function MonitoringPage() {
                     </Pie>
                     <Tooltip
                       contentStyle={{
-                        backgroundColor: theme.colors.card,
-                        border: `1px solid ${theme.colors.border}`,
+                        backgroundColor: '#0f172a',
+                        border: '1px solid #6366f1',
                         borderRadius: '8px',
                       }}
                     />
-                  </PieChart>
+                  </RePieChart>
                 </ResponsiveContainer>
               </div>
             </CardContent>
@@ -282,58 +349,121 @@ export default function MonitoringPage() {
         </motion.div>
       </div>
 
-      {/* Top Tools Table */}
-      <motion.div
-        initial={{ opacity: 0, y: 20 }}
-        animate={{ opacity: 1, y: 0 }}
-        transition={{ delay: 0.4 }}
-      >
-        <Card>
+      {/* Second Row - Additional Charts */}
+      <div className="grid lg:grid-cols-2 gap-6">
+        {/* Top Tools */}
+        <motion.div variants={item}>
+          <Card className="bg-slate-900/50 border-indigo-500/20">
+            <CardHeader>
+              <CardTitle className="text-white flex items-center gap-2">
+                <BarChart3 className="w-5 h-5 text-indigo-400" />
+                Top Tools by Execution
+              </CardTitle>
+            </CardHeader>
+            <CardContent>
+              <div className="h-64">
+                <ResponsiveContainer width="100%" height="100%">
+                  <BarChart data={topTools} layout="vertical">
+                    <XAxis type="number" stroke="#71717a" />
+                    <YAxis dataKey="name" type="category" stroke="#71717a" width={100} />
+                    <Tooltip
+                      contentStyle={{
+                        backgroundColor: '#0f172a',
+                        border: '1px solid #6366f1',
+                        borderRadius: '8px',
+                      }}
+                    />
+                    <Bar dataKey="executions" fill="#6366f1" radius={[0, 4, 4, 0]}>
+                      {topTools.map((entry, index) => (
+                        <Cell key={`cell-${index}`} fill={`hsl(${260 + index * 20}, 70%, 60%)`} />
+                      ))}
+                    </Bar>
+                  </BarChart>
+                </ResponsiveContainer>
+              </div>
+            </CardContent>
+          </Card>
+        </motion.div>
+
+        {/* Tool Performance Table */}
+        <motion.div variants={item}>
+          <Card className="bg-slate-900/50 border-indigo-500/20">
+            <CardHeader>
+              <CardTitle className="text-white flex items-center gap-2">
+                <LineChart className="w-5 h-5 text-indigo-400" />
+                Tool Performance
+              </CardTitle>
+            </CardHeader>
+            <CardContent>
+              <div className="overflow-x-auto">
+                <table className="w-full">
+                  <thead>
+                    <tr className="border-b border-indigo-500/20">
+                      <th className="text-left py-2 text-xs font-medium text-zinc-400">Tool</th>
+                      <th className="text-right py-2 text-xs font-medium text-zinc-400">Executions</th>
+                      <th className="text-right py-2 text-xs font-medium text-zinc-400">Success</th>
+                      <th className="text-right py-2 text-xs font-medium text-zinc-400">Avg Time</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {topTools.map((tool, idx) => (
+                      <tr key={tool.name} className="border-b border-indigo-500/10 hover:bg-slate-800/30">
+                        <td className="py-2 text-sm text-white">{tool.name}</td>
+                        <td className="py-2 text-right text-sm text-white">{tool.executions}</td>
+                        <td className="py-2 text-right text-sm text-emerald-400">{tool.success}%</td>
+                        <td className="py-2 text-right text-sm text-zinc-400">{tool.time}ms</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </CardContent>
+          </Card>
+        </motion.div>
+      </div>
+
+      {/* Alerts Section */}
+      <motion.div variants={item}>
+        <Card className="bg-slate-900/50 border-indigo-500/20">
           <CardHeader>
-            <CardTitle className="text-lg flex items-center gap-2">
-              <BarChart2 className="w-5 h-5 text-emerald-400" />
-              Top Tools Performance
-            </CardTitle>
+            <div className="flex items-center justify-between">
+              <CardTitle className="text-white flex items-center gap-2">
+                <Bell className="w-5 h-5 text-indigo-400" />
+                Active Alerts
+              </CardTitle>
+              <button
+                onClick={() => setShowResolved(!showResolved)}
+                className="text-xs text-indigo-400 hover:text-indigo-300 flex items-center gap-1"
+              >
+                <Filter className="w-3 h-3" />
+                {showResolved ? 'Hide Resolved' : 'Show Resolved'}
+              </button>
+            </div>
           </CardHeader>
           <CardContent>
-            <div className="overflow-x-auto">
-              <table className="w-full">
-                <thead>
-                  <tr className="border-b border-zinc-800">
-                    <th className="text-left py-3 px-4 text-sm font-medium text-zinc-400">Tool</th>
-                    <th className="text-right py-3 px-4 text-sm font-medium text-zinc-400">Executions</th>
-                    <th className="text-right py-3 px-4 text-sm font-medium text-zinc-400">Success Rate</th>
-                    <th className="text-right py-3 px-4 text-sm font-medium text-zinc-400">Avg Duration</th>
-                    <th className="text-right py-3 px-4 text-sm font-medium text-zinc-400">Trend</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {topTools.map((tool, idx) => (
-                    <motion.tr
-                      key={tool.name}
-                      initial={{ opacity: 0, x: -20 }}
-                      animate={{ opacity: 1, x: 0 }}
-                      transition={{ delay: idx * 0.05 }}
-                      className="border-b border-zinc-800/50 hover:bg-zinc-800/30 transition-colors"
-                    >
-                      <td className="py-3 px-4 font-mono text-sm text-white">{tool.name}</td>
-                      <td className="py-3 px-4 text-right text-white">{tool.executions}</td>
-                      <td className="py-3 px-4 text-right">
-                        <span className="text-emerald-400">{tool.success}%</span>
-                      </td>
-                      <td className="py-3 px-4 text-right text-zinc-400">{tool.time}ms</td>
-                      <td className="py-3 px-4 text-right">
-                        <div className="w-20 h-1 bg-zinc-800 rounded-full overflow-hidden ml-auto">
-                          <div 
-                            className="h-full bg-emerald-500"
-                            style={{ width: `${Math.min(100, tool.success)}%` }}
-                          />
-                        </div>
-                      </td>
-                    </motion.tr>
-                  ))}
-                </tbody>
-              </table>
+            <div className="space-y-3">
+              {filteredAlerts.map((alert) => (
+                <div
+                  key={alert.id}
+                  className={cn(
+                    'flex items-center justify-between p-3 rounded-lg border',
+                    getSeverityColor(alert.severity)
+                  )}
+                >
+                  <div className="flex items-center gap-3">
+                    {alert.severity === 'critical' && <AlertCircle className="w-4 h-4" />}
+                    {alert.severity === 'warning' && <AlertCircle className="w-4 h-4" />}
+                    {alert.severity === 'info' && <Bell className="w-4 h-4" />}
+                    <div>
+                      <p className="text-sm font-medium">{alert.message}</p>
+                      <p className="text-xs opacity-70">{alert.time}</p>
+                    </div>
+                  </div>
+                  <Badge variant={alert.status === 'active' ? 'destructive' : 'secondary'}>
+                    {alert.status}
+                  </Badge>
+                </div>
+              ))}
             </div>
           </CardContent>
         </Card>

@@ -1,10 +1,11 @@
+# api/routes/dashboard.py
 from fastapi import APIRouter, Request
 
-router = APIRouter()
-
+router = APIRouter(tags=["dashboard"])
 
 @router.get("/dashboard")
 def dashboard(request: Request):
+    """Get dashboard metrics"""
     scheduler = request.app.state.scheduler
 
     total_processes = len(scheduler.processes)
