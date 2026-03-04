@@ -1,0 +1,40 @@
+# 1. Simple deployment
+curl -X POST http://127.0.0.1:8000/tasks \
+  -H "Content-Type: application/json" \
+  -d '{"goal": "deploy to production"}'
+
+# 2. Security focused
+curl -X POST http://127.0.0.1:8000/tasks \
+  -H "Content-Type: application/json" \
+  -d '{"goal": "run security scan and check dependencies"}'
+
+# 3. Build and test
+curl -X POST http://127.0.0.1:8000/tasks \
+  -H "Content-Type: application/json" \
+  -d '{"goal": "build the app and run tests"}'
+
+# 4. Complex workflow
+curl -X POST http://127.0.0.1:8000/tasks \
+  -H "Content-Type: application/json" \
+  -d '{"goal": "clone, build, test, scan, and deploy to staging"}'
+
+
+
+# Check if OTEL_ENABLED is set
+echo $OTEL_ENABLED
+
+# If nothing shows or it's "false", enable it:
+export OTEL_ENABLED=true
+export OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4317
+
+# Make these permanent (add to your ~/.bashrc)
+echo 'export OTEL_ENABLED=true' >> ~/.bashrc
+echo 'export OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4317' >> ~/.bashrc
+source ~/.bashrc
+
+
+# Stop your current app (Ctrl+C), then restart:
+uvicorn api.app:app --reload --host 0.0.0.0 --port 8000
+
+
+

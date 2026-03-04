@@ -2,38 +2,59 @@ import asyncio
 import json
 import uuid
 import time
+from datetime import datetime
+from uuid import UUID
 
 from nats.aio.client import Client as NATS 
 from tool_registry.registry import ToolRegistry
 from axr_core.distributed.message import result_message
 from axr_core.capabilities.models import Capability
-from datetime import datetime
-from uuid import UUID
 
+
+# registry = ToolRegistry()
+worker_id = str(uuid.uuid4())
+WORKER_CAPACITY = 10
+# Use a mutable object for load tracking
+worker_state = {"current_load": 0}
+REGISTRATION_SENT = False
 
 registry = ToolRegistry()
 
-worker_id = str(uuid.uuid4())
 
 async def main():
+    global worker_state, REGISTRATION_SENT
     nc = NATS()
-    
+
     # Connect with proper error handling
     try:
-        await nc.connect("nats://127.0.0.1:4222", max_reconnect_attempts=-1)
-        print(f"[WORKER {worker_id}] connected to NATS")
+        await nc.connect(
+            "nats://127.0.0.1:4222", 
+            max_reconnect_attempts=-1,
+            name=f"worker-{worker_id[:8]}"
+        )
+        print(f"[WORKER {worker_id[:8]}] ✅ Connected to NATS")
     except Exception as e:
-        print(f"[WORKER {worker_id}] Failed to connect to NATS: {e}")
+        print(f"[WORKER {worker_id[:8]}] ❌ Failed to connect to NATS: {e}")
         return
 
     async def handle_task(msg):
-        print(f"[WORKER {worker_id}] Received task on {msg.subject}")
+        worker_state["current_load"] += 1
+        current = worker_state["current_load"]
+        print(f"[WORKER {worker_id[:8]}] 📨 Received task on {msg.subject} (load: {current}/{WORKER_CAPACITY})")
+        
+        # Extract headers if present (for tracing)
+        headers = getattr(msg, 'headers', {})
+        if headers:
+            print(f"[WORKER {worker_id[:8]}] Headers: {headers}")
         
         try:
             data = json.loads(msg.data.decode())
             
             cap_data = data.get("capability")
             cap = None
+            pid = None
+            step_id = None
+            syscall = None
 
             if cap_data:
                 cap = Capability(
@@ -51,7 +72,7 @@ async def main():
             step_id = UUID(data["step_id"])
             syscall = data["syscall"]
 
-            print(f"[WORKER {worker_id}] Executing {syscall} for process {pid}")
+            print(f"[WORKER {worker_id[:8]}] ⚙️ Executing {syscall} for process {str(pid)[:8]}")
 
             # Get the tool
             tool = registry.get_tool(syscall)
@@ -66,7 +87,9 @@ async def main():
             process_ctx = WorkerProcess(pid)
 
             # Execute the tool
+            start_time = time.time()
             result = tool.execute(process_ctx, data.get("inputs", {}), cap)
+            duration = time.time() - start_time
 
             # Send success result
             await nc.publish(
@@ -74,63 +97,79 @@ async def main():
                 result_message(pid, step_id, "success", output=result, error=None, capability=cap),
             )
 
-            print(f"[WORKER {worker_id}] Completed {syscall} successfully")
+            print(f"[WORKER {worker_id[:8]}] ✅ Completed {syscall} in {duration:.2f}s")
 
         except Exception as e:
-            print(f"[WORKER {worker_id}] Failed {syscall}: {e}")
+            print(f"[WORKER {worker_id[:8]}] ❌ Failed: {e}")
             
             # Send failure result
-            await nc.publish(
-                "axr.results",
-                result_message(pid, step_id, "failed", output=None, error=str(e), capability=cap),
-            )
+            if pid and step_id:
+                await nc.publish(
+                    "axr.results",
+                    result_message(pid, step_id, "failed", output=None, error=str(e), capability=cap),
+                )
+        finally:
+            worker_state["current_load"] -= 1
 
     # Subscribe to worker-specific topic
     await nc.subscribe(f"axr.tasks.{worker_id}", cb=handle_task)
+    print(f"[WORKER {worker_id[:8]}] 📡 Subscribed to axr.tasks.{worker_id[:8]}")
     
     # Also subscribe to broadcast topic if needed
     await nc.subscribe("axr.tasks.broadcast", cb=handle_task)
+    print(f"[WORKER {worker_id[:8]}] 📡 Subscribed to axr.tasks.broadcast")
     
     await nc.flush()
-    print(f"[WORKER {worker_id}] subscribed to axr.tasks.{worker_id}")
 
-    # Send initial heartbeat immediately
+    # Get tools list
     tools = [tool.name for tool in registry.list_tools()]
-    WORKER_CAPACITY = 10
+    print(f"[WORKER {worker_id[:8]}] 🛠️ Loaded tools: {tools}")
     
+    # Send initial registration heartbeat with tools (CRITICAL!)
+    # This MUST be sent BEFORE starting the heartbeat loop
+    reg_payload = {
+        "worker_id": worker_id,
+        "tools": tools,  # This MUST be included for registration
+        "capacity": WORKER_CAPACITY,
+        "load": worker_state["current_load"],
+        "timestamp": time.time(),
+    }
     await nc.publish(
         "axr.heartbeat",
-        json.dumps({
-            "worker_id": worker_id,
-            "tools": tools,
-            "capacity": WORKER_CAPACITY,
-            "timestamp": time.time(),
-        }).encode(),
+        json.dumps(reg_payload).encode(),
     )
-    print(f"[WORKER {worker_id}] Sent initial heartbeat with tools: {tools}")
+    print(f"[WORKER {worker_id[:8]}] 💓 Sent REGISTRATION heartbeat with {len(tools)} tools")
+    REGISTRATION_SENT = True
 
-    # Heartbeat loop
+    # Small delay to ensure registration is processed
+    await asyncio.sleep(0.5)
+
+    # Heartbeat loop - ALWAYS send full state (idempotent)
     async def send_heartbeat():
         while True:
             try:
+                hb_payload = {
+                    "worker_id": worker_id,
+                    "tools": tools,  # ✅ ALWAYS include
+                    "capacity": WORKER_CAPACITY,  # ✅ ALWAYS include
+                    "load": worker_state["current_load"],
+                    "timestamp": time.time(),
+                }
+
                 await nc.publish(
                     "axr.heartbeat",
-                    json.dumps({
-                        "worker_id": worker_id,
-                        "tools": tools,
-                        "capacity": WORKER_CAPACITY,
-                        "timestamp": time.time(),
-                    }).encode(),
+                    json.dumps(hb_payload).encode(),
                 )
-                print(f"[WORKER {worker_id}] Heartbeat sent")
+
                 await asyncio.sleep(5)
+
             except Exception as e:
-                print(f"[WORKER {worker_id}] Heartbeat error: {e}")
+                print(f"[WORKER {worker_id[:8]}] ❤️ Heartbeat error: {e}")
                 await asyncio.sleep(1)
 
     asyncio.create_task(send_heartbeat())
 
-    print(f"[WORKER {worker_id}] Ready and listening")
+    print(f"[WORKER {worker_id[:8]}] 🚀 Ready and listening")
 
     # Keep running
     while True:
@@ -140,4 +179,4 @@ if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        print(f"[WORKER {worker_id}] Shutting down")
+        print(f"[WORKER {worker_id[:8]}] 👋 Shutting down")

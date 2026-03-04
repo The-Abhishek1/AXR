@@ -43,6 +43,7 @@ class AIProcess:
     current_step_id: Optional[UUID] = None
     error_message: Optional[str] = None
     
+    completed_at = None
     # -----------------------------------
     # Kernel lifecycle operations
     # -----------------------------------
@@ -69,6 +70,7 @@ class AIProcess:
     def terminate(self) -> None:
         self.state = ProcessState.TERMINATED
         self.terminated_at = datetime.utcnow()
+        self.completed_at = datetime.utcnow()
         
     def fail(self, message: str) -> None:
         self.state = ProcessState.FAILED
