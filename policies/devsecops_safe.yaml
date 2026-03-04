@@ -6,7 +6,7 @@ allowed_syscalls:
   - git.clone           # Clone git repositories
   
   # Security Scanning
-  - sast.scan           # Static application security testing
+             # Static application security testing
   - dependency.check    # Check for vulnerable dependencies
   
   # Code Quality
@@ -25,7 +25,8 @@ denied_syscalls:
   - rm -rf              # Prevent destructive file operations
   - sudo                # Prevent privilege escalation
   - chmod 777          # Prevent permission changes
-  - curl external       # Block unauthorized external calls (use tools instead)
+  - curl external  
+  - sast.scan     # Block unauthorized external calls (use tools instead)
   
   # Potentially dangerous tools (uncomment if needed)
   # - docker.run         # Container execution (enable with caution)
