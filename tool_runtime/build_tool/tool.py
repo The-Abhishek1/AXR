@@ -4,6 +4,10 @@ import random
 from tool_runtime.base_tool.tool import BaseTool
 
 class BuildTool(BaseTool):
+    name = "Build Tool"
+    syscall = "build"
+    description = "Build application artifacts"
+    
     def execute(self, process, step, memory_manager=None):
         print(f"[TOOL] 🔨 build executing for PID={process.pid}")
         time.sleep(0.8)

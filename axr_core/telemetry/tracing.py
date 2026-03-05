@@ -31,7 +31,6 @@ def setup_telemetry(service_name: str = "axr-scheduler"):
 
     # 🔥 Prevent override
     if isinstance(trace.get_tracer_provider(), TracerProvider):
-        print("🔍 Tracer already initialized")
         _tracer = trace.get_tracer(service_name)
         return _tracer
 

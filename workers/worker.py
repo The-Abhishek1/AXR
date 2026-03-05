@@ -6,19 +6,16 @@ from datetime import datetime
 from uuid import UUID
 
 from nats.aio.client import Client as NATS 
-from tool_registry.registry import ToolRegistry
+from tool_registry.registry import tool_registry as registry
 from axr_core.distributed.message import result_message
 from axr_core.capabilities.models import Capability
 
-
-# registry = ToolRegistry()
 worker_id = str(uuid.uuid4())
 WORKER_CAPACITY = 10
 # Use a mutable object for load tracking
 worker_state = {"current_load": 0}
 REGISTRATION_SENT = False
 
-registry = ToolRegistry()
 
 
 async def main():
@@ -89,6 +86,7 @@ async def main():
             # Execute the tool
             start_time = time.time()
             result = tool.execute(process_ctx, data.get("inputs", {}), cap)
+            
             duration = time.time() - start_time
 
             # Send success result
@@ -122,7 +120,7 @@ async def main():
     await nc.flush()
 
     # Get tools list
-    tools = [tool.name for tool in registry.list_tools()]
+    tools = [tool.syscall for tool in registry.list_tools()]
     print(f"[WORKER {worker_id[:8]}] 🛠️ Loaded tools: {tools}")
     
     # Send initial registration heartbeat with tools (CRITICAL!)

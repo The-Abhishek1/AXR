@@ -4,6 +4,12 @@ import random
 from tool_runtime.base_tool.tool import BaseTool
 
 class DEPLOYTool(BaseTool):
+    
+    name = "Deploy Tool"
+    syscall = "deploy.service"
+    description = "Deploy application to environment"
+
+    
     def execute(self, process, step, memory_manager=None):
         print(f"[TOOL] 🚀 deploy.service executing for PID={process.pid}")
         time.sleep(1.5)

@@ -8,9 +8,8 @@ from axr_core.process_scheduler.scheduler import ProcessScheduler
 from axr_core.persistence.models import Base
 from api.deps.db import engine
 from axr_core.agents.llm_client import LLMClient
-from axr_core.agents.mock_agents import initialize_mock_agents
-from axr_core.agents.agent_registry import agent_registry
-
+from axr_core.agents.service.dynamic_agent_loader import DynamicAgentLoader
+from axr_core.agents.registry.agent_registry import agent_registry
 # Import all routers
 from api.routes import (
     tasks, tools, policies, replay, events, 
@@ -20,23 +19,15 @@ from api.routes import (
 
 # Telemetry imports (with fallback)
 try:
-    print("🔍 Attempting to import telemetry...")
     from axr_core.telemetry import setup_telemetry, get_metrics, setup_metrics
     from axr_core.telemetry.metrics import update_process_state, update_active_steps
     TELEMETRY_AVAILABLE = True
-    print("✅ Telemetry imported successfully")
+
 except ImportError as e:
     TELEMETRY_AVAILABLE = False
-    print(f"❌ Telemetry import failed: {e}")
-    # Create dummy functions
-    def setup_telemetry(*args, **kwargs): return None
-    def get_metrics(): return b""
-    def setup_metrics(*args): return None
-    def update_process_state(*args): pass
-    def update_active_steps(*args): pass
 
 # Single scheduler instance
-scheduler = ProcessScheduler(max_workers=50)
+scheduler = None
 
 # Variable to store scheduler task
 scheduler_task = None
@@ -45,19 +36,22 @@ scheduler_task = None
 async def lifespan(app: FastAPI):
 
     global scheduler_task
-
-    print("[STARTUP] Initializing AXR...")
-
+    
+    global scheduler
+    
     if TELEMETRY_AVAILABLE and os.getenv("OTEL_ENABLED", "false").lower() == "true":
         tracer = setup_telemetry(service_name="axr-api")
         app.state.tracer = tracer
         setup_metrics("axr-api")
-        print("🔍 Telemetry initialized")
-
-    Base.metadata.create_all(bind=engine)
-
+    
+    scheduler = ProcessScheduler(max_workers=50)
+    
     # Initialize NATS
     await scheduler.init_nats()
+
+    print("[STARTUP] Initializing AXR...")
+
+    Base.metadata.create_all(bind=engine)
 
     # Start core scheduler
     scheduler_task = asyncio.create_task(scheduler.start())
@@ -68,14 +62,14 @@ async def lifespan(app: FastAPI):
     # Start autoscaler
     asyncio.create_task(scheduler.autoscaler.start())
 
-    initialize_mock_agents()
+    loader = DynamicAgentLoader(agent_registry)
+    loader.load_agents()
 
     scheduler.worker_registry.cleanup_invalid_workers()
 
     app.state.scheduler = scheduler
 
-    print(f"[STARTUP] Active agents: {len(agent_registry.list_agents())}")
-    print(f"[STARTUP] Agent roles: {[a['role'] for a in agent_registry.list_agents()]}")
+    print(f"[STARTUP] Active agents: {len(agent_registry.get_all_agents())}")
     print("[STARTUP] ✅ System ready")
 
     yield

@@ -4,6 +4,11 @@ import random
 from tool_runtime.base_tool.tool import BaseTool
 
 class SASTTool(BaseTool):
+    
+    name = "SAST Tool"
+    syscall = "sast.scan"
+    description = "Static application security testing"
+    
     def execute(self, process, step, memory_manager=None):
         print(f"[TOOL] 🔒 sast.scan executing for PID={process.pid}")
         time.sleep(1.0)

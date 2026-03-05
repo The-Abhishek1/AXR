@@ -33,6 +33,8 @@ from axr_core.reliability.lease_manager import LeaseManager
 from axr_core.distributed.worker_registry import worker_registry
 from axr_core.event_scheduler.scheduler import EventDrivenScheduler
 from axr_core.cluster.autoscaler import WorkerAutoScaler
+from axr_core.artifacts.artifact_manager import artifact_manager
+
 
 # Telemetry imports with fallback
 try:
@@ -53,7 +55,6 @@ try:
         trace_nats_message
     )
     TELEMETRY_AVAILABLE = True
-    print("[TELEMETRY] ✅ Telemetry modules loaded")
 except ImportError as e:
     print(f"[TELEMETRY] ⚠️ Telemetry not available: {e}")
     TELEMETRY_AVAILABLE = False
@@ -132,7 +133,6 @@ class ProcessScheduler:
         if TELEMETRY_AVAILABLE and os.getenv("OTEL_ENABLED", "false").lower() == "true":
             _setup_telemetry("axr-scheduler")
             self.tracer = _get_tracer("scheduler")
-            print("[TELEMETRY] ✅ OpenTelemetry initialized for scheduler")
         else:
             print("[TELEMETRY] ⚠️ Telemetry disabled for scheduler")
             
@@ -169,7 +169,6 @@ class ProcessScheduler:
         await self.nats.connect()
         await self.nats.subscribe("axr.results", self._on_result)
         await self.nats.subscribe("axr.heartbeat", cb=self._handle_heartbeat)
-        print("[NATS] Scheduler connected and subscribed to axr.results")
         await self.nats.nc.flush()
     
     # ---------------------------
@@ -499,6 +498,14 @@ class ProcessScheduler:
                             metadata={"reason": "security_policy"},
                         )
                     )
+                    
+                    self._finalize_processes()
+                    # 🔑 trigger scheduler reevaluation
+                    try:
+                        asyncio.create_task(self.event_scheduler.enqueue(process))
+                    except Exception:
+                        pass
+
                     continue
                 
                 remaining_budget = process.remaining_budget()
@@ -833,7 +840,19 @@ class ProcessScheduler:
                 )
 
                 if data.get("output"):
+                    output = data["output"]
+                    
                     self.memory_manager.write_output(pid, step_id, data["output"])
+                    
+
+                    artifacts = artifact_manager.handle_step_output(
+                        pid,
+                        step_id,
+                        output
+                    )
+                    
+                    if artifacts:
+                        print(f"[ARTIFACT] Stored {len(artifacts)} artifacts")
 
                 self.event_bus.publish(
                     Event(
@@ -954,7 +973,7 @@ class ProcessScheduler:
                 any_skipped = any(step.status == StepStatus.SKIPPED for step in steps)
                 all_success = all(step.status == StepStatus.SUCCESS for step in steps)
                 
-                if (any_failed or any_skipped) and process.state != ProcessState.FAILED:
+                if (any_failed or any_skipped) and not getattr(process, "finalized", False):
                     print(f"[PROCESS] {pid} transitioning to FAILED → triggering rollback")
 
                     process.fail("One or more steps failed/skipped")
@@ -1251,6 +1270,14 @@ class ProcessScheduler:
                     metadata={"reason": "security_policy"},
                 )
             )
+            
+            self._finalize_processes()
+            # 🔑 trigger scheduler reevaluation
+            try:
+                asyncio.create_task(self.event_scheduler.enqueue(process))
+            except RuntimeError:
+                pass
+
             return False
         
         # 🧠 RESOURCE CHECK (budget)
@@ -1415,3 +1442,5 @@ class ProcessScheduler:
             task = asyncio.create_task(self._execute_step(process, step))
             self.tasks.add(task)
             task.add_done_callback(self.tasks.discard)
+            
+            self._finalize_processes()

@@ -48,6 +48,8 @@ class ProcessStep:
     finalized: bool = False
     priority: int = 1
     
+    inputs: dict = field(default_factory=dict)
+    outputs: dict = field(default_factory=dict)
     # -------------------------------
     # State transitions
     # -------------------------------

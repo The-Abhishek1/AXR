@@ -4,6 +4,11 @@ import random
 from tool_runtime.base_tool.tool import BaseTool
 
 class TestTool(BaseTool):
+    
+    name = "Test Tool"
+    syscall = "test.clone"
+    description = "Run unit/integration tests"
+    
     def execute(self, process, step, memory_manager=None):
         print(f"[TOOL] 🧪 test.run executing for PID={process.pid}")
         time.sleep(1.2)

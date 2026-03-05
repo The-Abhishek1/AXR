@@ -4,6 +4,11 @@ import random
 from tool_runtime.base_tool.tool import BaseTool
 
 class LINTTool(BaseTool):
+    
+    name = "Lint Tool"
+    syscall = "lint"
+    description = "Lint source code for style issues"
+    
     def execute(self, process, step, memory_manager=None):
         print(f"[TOOL] ✨ lint executing for PID={process.pid}")
         time.sleep(0.4)

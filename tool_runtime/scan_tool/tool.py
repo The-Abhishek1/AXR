@@ -4,6 +4,11 @@ import random
 from tool_runtime.base_tool.tool import BaseTool
 
 class ScanTool(BaseTool):
+    
+    name = "SCAN Tool"
+    syscall = "dependency.check"
+    description = "Check for vulnerable dependenciesy"
+    
     def execute(self, process, step, memory_manager=None):
         print(f"[TOOL] 🔍 dependency.check executing for PID={process.pid}")
         time.sleep(0.6)
