@@ -250,6 +250,22 @@ class ProcessScheduler:
 
     async def _schedule_cycle(self) -> None:
         """Async scheduling cycle with advanced policies"""
+    
+        span_ctx = None
+
+        if TELEMETRY_ENABLED and self.tracer:
+            span_ctx = self.tracer.start_as_current_span(
+                "scheduler.schedule_cycle",
+                attributes={
+                    "process.count": len(self.processes),
+                    "global.active_steps": self._global_active_steps,
+                }
+            )
+
+        if span_ctx:
+            span_ctx.__enter__()
+        
+        
         cycle_start = time.time()
         
         # Process retries first (this can remain sync)
@@ -270,7 +286,7 @@ class ProcessScheduler:
         # Debug current resource state
         self._last_cycle_print = getattr(self, "_last_cycle_print", 0)
 
-        if time.time() - self._last_cycle_print > 2:
+        if time.time() - self._last_cycle_print > 5:
             print(f"[SCHED-CYCLE] Active: {self._global_active_steps}")
             self._last_cycle_print = time.time()
         
@@ -296,7 +312,12 @@ class ProcessScheduler:
         selected_process = self.advanced_scheduler.select_next_process(
             active_processes, context
         )
-        
+
+        if TELEMETRY_ENABLED and self.tracer and selected_process:
+            with self.tracer.start_as_current_span("scheduler.process_select") as span:
+                span.set_attribute("process.id", str(selected_process.pid)[:8])
+                span.set_attribute("process.state", selected_process.state.name)
+                
         if not selected_process:
             return
         
@@ -333,10 +354,14 @@ class ProcessScheduler:
         selected_step = self.advanced_scheduler.select_next_step(
             process, ready_steps, context
         )
-        
-        if not selected_step:
-            return
-        
+
+        if TELEMETRY_ENABLED and self.tracer and selected_step:
+            with self.tracer.start_as_current_span("scheduler.step_select") as span:
+                span.set_attribute("process.id", str(process.pid)[:8])
+                span.set_attribute("step.syscall", selected_step.syscall)
+                if not selected_step:
+                    return
+                
         step = selected_step
         
         # Check parallel limits
@@ -403,6 +428,9 @@ class ProcessScheduler:
         self._check_expired_leases()
         
         print("[SCHED] Active processes:", [str(p.pid)[:8] for p in active_processes])
+        
+        if span_ctx:
+            span_ctx.__exit__(None, None, None)
         
     
     def _schedule_cycle_no_telemetry(self):
@@ -662,7 +690,23 @@ class ProcessScheduler:
             # Publish to NATS with headers
             try:
                 # Use await directly since we're in async context
-                await self.nats.publish(f"axr.tasks.{target_worker}", payload, headers=headers)
+                if TELEMETRY_ENABLED and self.tracer:
+                    with self.tracer.start_as_current_span("nats.publish") as span:
+                        span.set_attribute("worker.id", target_worker[:8])
+                        span.set_attribute("step.syscall", step.syscall)
+                        span.set_attribute("nats.subject", f"axr.tasks.{target_worker}")
+
+                        await self.nats.publish(
+                            f"axr.tasks.{target_worker}",
+                            payload,
+                            headers=headers
+                        )
+                else:
+                    await self.nats.publish(
+                        f"axr.tasks.{target_worker}",
+                        payload,
+                        headers=headers
+                    )
                 print(f"[ROUTE] ✅ {step.syscall} -> Worker_ID: {target_worker[:8]}")
                 
                 # Start lease tracking
@@ -782,6 +826,14 @@ class ProcessScheduler:
 
         pid = UUID(data["pid"])
         step_id = UUID(data["step_id"])
+        
+        if TELEMETRY_ENABLED:
+            from opentelemetry import trace
+            span = trace.get_current_span()
+
+            span.set_attribute("process.id", str(pid)[:8])
+            span.set_attribute("step.id", str(step_id)[:8])
+            span.set_attribute("result.status", data.get("status"))
 
         process = self.processes.get(pid)
         steps = self.steps.get(pid, [])
@@ -934,6 +986,9 @@ class ProcessScheduler:
             self.worker_registry.register(worker_id, tools, capacity)
 
         self.worker_registry.heartbeat(worker_id, load)
+        
+        if TELEMETRY_ENABLED:
+            record_worker_load(worker_id, load, tools)
 
         # wake scheduler when new worker appears
         for process in self.processes.values():
@@ -1299,7 +1354,15 @@ class ProcessScheduler:
         
         # 👷 WORKER AVAILABILITY CHECK (new)
         if not workers:
-            print(f"[WORKER] No worker available for {step.syscall}, will retry later")
+            print(f"[AUTOSCALE] No worker for {step.syscall}")
+
+            try:
+                asyncio.create_task(
+                    self.autoscaler.scale_up()
+                )
+            except RuntimeError:
+                pass
+
             return False
         
         return True
@@ -1350,6 +1413,12 @@ class ProcessScheduler:
     async def _acquire_worker_for_step(self, step_syscall: str) -> Optional[str]:
         """Acquire a worker for a step with load balancing"""
         
+        if TELEMETRY_ENABLED and self.tracer:
+            span = self.tracer.start_span("worker.acquire")
+            span.set_attribute("step.syscall", step_syscall)
+        else:
+            span = None
+        
         # Try to acquire worker with retry logic
         max_attempts = 3
         for attempt in range(max_attempts):
@@ -1364,6 +1433,11 @@ class ProcessScheduler:
                 await asyncio.sleep(0.2)  # Small delay between retries
         
         print(f"[WORKER] ❌ Failed to acquire worker for {step_syscall} after {max_attempts} attempts")
+        
+        if span:
+            span.set_attribute("worker.id",worker_id)
+            span.end()
+            
         return None
     
     async def wait_for_workers(self, timeout: int = 10) -> bool:
