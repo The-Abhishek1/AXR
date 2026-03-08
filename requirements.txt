@@ -21,3 +21,10 @@ opentelemetry-instrumentation-redis
 opentelemetry-instrumentation-sqlalchemy 
 opentelemetry-instrumentation-logging
 opentelemetry-bootstrap -a install
+fastapi==0.104.1
+uvicorn[standard]==0.24.0
+nats-py==2.5.0
+pydantic==2.4.2
+python-multipart==0.0.6
+requests==2.31.0
+black==23.11.0 

@@ -23,7 +23,7 @@ from axr_core.transactions.transaction_manager import TransactionManager
 from axr_core.checkpointing.checkpoint_manager import CheckpointManager
 from axr_core.retry.retry_manager import RetryManager
 from axr_core.events.event_bus import EventBus
-from axr_core.events.event import Event
+from axr_core.events.event import Event, EventType
 from axr_core.resource_manager.resource_manager import ResourceManager
 from axr_core.resource_manager.resource_model import ProcessResources
 from axr_core.persistence.repository import PersistenceRepository
@@ -34,7 +34,8 @@ from axr_core.distributed.worker_registry import worker_registry
 from axr_core.event_scheduler.scheduler import EventDrivenScheduler
 from axr_core.cluster.autoscaler import WorkerAutoScaler
 from axr_core.artifacts.artifact_manager import artifact_manager
-
+from opentelemetry import trace
+from opentelemetry.context import get_current
 
 # Telemetry imports with fallback
 try:
@@ -52,8 +53,10 @@ try:
     from axr_core.telemetry.tracing import (
         trace_step,
         trace_async_step,
-        trace_nats_message
+        trace_nats_message,
+        trace_scheduler_cycle
     )
+    
     TELEMETRY_AVAILABLE = True
 except ImportError as e:
     print(f"[TELEMETRY] ⚠️ Telemetry not available: {e}")
@@ -247,23 +250,10 @@ class ProcessScheduler:
     # ---------------------------
     # Core scheduling cycle
     # ---------------------------
-
+    
+    @trace_scheduler_cycle
     async def _schedule_cycle(self) -> None:
         """Async scheduling cycle with advanced policies"""
-    
-        span_ctx = None
-
-        if TELEMETRY_ENABLED and self.tracer:
-            span_ctx = self.tracer.start_as_current_span(
-                "scheduler.schedule_cycle",
-                attributes={
-                    "process.count": len(self.processes),
-                    "global.active_steps": self._global_active_steps,
-                }
-            )
-
-        if span_ctx:
-            span_ctx.__enter__()
         
         
         cycle_start = time.time()
@@ -300,11 +290,6 @@ class ProcessScheduler:
             ]
         
         if not active_processes:
-            if TELEMETRY_ENABLED and self.tracer:
-                with self.tracer.start_as_current_span("schedule_cycle") as span:
-                    span.set_attribute("cycle.duration_ms", (time.time() - cycle_start) * 1000)
-                    span.set_attribute("processes.active", 0)
-                    span.set_attribute("steps.scheduled", 0)
             return
         
         # Use advanced scheduler to select next process
@@ -312,12 +297,12 @@ class ProcessScheduler:
         selected_process = self.advanced_scheduler.select_next_process(
             active_processes, context
         )
+        
+        if TELEMETRY_ENABLED:
+            span = trace.get_current_span()
+            if span and span.is_recording():
+                span.set_attribute("scheduler.selected_step", selected_step.syscall)
 
-        if TELEMETRY_ENABLED and self.tracer and selected_process:
-            with self.tracer.start_as_current_span("scheduler.process_select") as span:
-                span.set_attribute("process.id", str(selected_process.pid)[:8])
-                span.set_attribute("process.state", selected_process.state.name)
-                
         if not selected_process:
             return
         
@@ -327,7 +312,7 @@ class ProcessScheduler:
             process.start()
             self._active_steps_per_process[process.pid] = 0
             self.event_bus.publish(
-                Event(event_type="PROCESS_STARTED", pid=process.pid)
+                Event(type=EventType.PROCESS_STARTED, pid=process.pid)
             )
         
         # Get steps for this process
@@ -354,15 +339,18 @@ class ProcessScheduler:
         selected_step = self.advanced_scheduler.select_next_step(
             process, ready_steps, context
         )
-
-        if TELEMETRY_ENABLED and self.tracer and selected_step:
-            with self.tracer.start_as_current_span("scheduler.step_select") as span:
-                span.set_attribute("process.id", str(process.pid)[:8])
-                span.set_attribute("step.syscall", selected_step.syscall)
-                if not selected_step:
-                    return
-                
+        
+        if TELEMETRY_ENABLED:
+            span = trace.get_current_span()
+            if span and span.is_recording():
+                span.set_attribute("scheduler.selected_step", selected_step.syscall)
+                        
         step = selected_step
+        
+        # Add trace attributes for selected step
+        if TELEMETRY_ENABLED and self.tracer:
+            span = trace.get_current_span()
+            span.set_attribute("selected.step", step.syscall)
         
         # Check parallel limits
         active = self._active_steps_per_process.get(process.pid, 0)
@@ -394,7 +382,7 @@ class ProcessScheduler:
         # Publish READY event
         self.event_bus.publish(
             Event(
-                event_type="STEP_READY",
+                type=EventType.STEP_READY,
                 pid=process.pid,
                 step_id=step.step_id,
                 metadata={"syscall": step.syscall},
@@ -410,27 +398,20 @@ class ProcessScheduler:
         
         # Submit for execution - NOW ASYNC WITH SEMAPHORE
         await self.semaphore.acquire()
-        task = asyncio.create_task(self._execute_step(process, step))
+        ctx = get_current()
+        task = asyncio.create_task(
+            self._execute_step(process, step),
+            context=ctx
+        )
         task.add_done_callback(lambda t: self.semaphore.release())
         self.tasks.add(task)
         task.add_done_callback(self.tasks.discard)
-        
-        # Record telemetry
-        if TELEMETRY_ENABLED and self.tracer:
-            with self.tracer.start_as_current_span("schedule_cycle") as span:
-                span.set_attribute("steps.scheduled", 1)
-                span.set_attribute("global.active_steps", self._global_active_steps)
-                span.set_attribute("processes.active", len(active_processes))
-                span.set_attribute("cycle.duration_ms", (time.time() - cycle_start) * 1000)
         
         # Finalize any completed processes
         self._finalize_processes()
         self._check_expired_leases()
         
         print("[SCHED] Active processes:", [str(p.pid)[:8] for p in active_processes])
-        
-        if span_ctx:
-            span_ctx.__exit__(None, None, None)
         
     
     def _schedule_cycle_no_telemetry(self):
@@ -483,7 +464,7 @@ class ProcessScheduler:
                 process.start()
                 self._active_steps_per_process[process.pid] = 0
                 self.event_bus.publish(
-                    Event(event_type="PROCESS_STARTED", pid=process.pid)
+                    Event(type=EventType.PROCESS_STARTED, pid=process.pid)
                 )
 
             steps = self.steps.get(process.pid, [])
@@ -520,7 +501,7 @@ class ProcessScheduler:
                     self.repo.save_step(step)
                     self.event_bus.publish(
                         Event(
-                            event_type="STEP_FAILED",
+                            type=EventType.STEP_FAILED,
                             pid=process.pid,
                             step_id=step.step_id,
                             metadata={"reason": "security_policy"},
@@ -550,7 +531,7 @@ class ProcessScheduler:
 
                 self.event_bus.publish(
                     Event(
-                        event_type="STEP_READY",
+                        type=EventType.STEP_READY,
                         pid=process.pid,
                         step_id=step.step_id,
                         metadata={"syscall": step.syscall},
@@ -607,7 +588,7 @@ class ProcessScheduler:
         # Publish started event
         self.event_bus.publish(
             Event(
-                event_type="STEP_STARTED",
+                type=EventType.STEP_STARTED,
                 pid=process.pid,
                 step_id=step.step_id,
                 metadata={"syscall": step.syscall},
@@ -750,7 +731,7 @@ class ProcessScheduler:
             step.fail(str(e))
             self.event_bus.publish(
                 Event(
-                    event_type="STEP_FAILED",
+                    type=EventType.STEP_FAILED,
                     pid=process.pid,
                     step_id=step.step_id,
                     metadata={"error": str(e)},
@@ -815,12 +796,6 @@ class ProcessScheduler:
     
     @trace_nats_message
     async def _on_result(self, msg):
-        
-        # Extract headers if present
-        headers = getattr(msg, 'headers', {})
-        if headers:
-            from axr_core.telemetry.tracing import extract_trace_from_headers
-            extract_trace_from_headers(headers)
             
         data = json.loads(msg.data.decode())
 
@@ -828,7 +803,6 @@ class ProcessScheduler:
         step_id = UUID(data["step_id"])
         
         if TELEMETRY_ENABLED:
-            from opentelemetry import trace
             span = trace.get_current_span()
 
             span.set_attribute("process.id", str(pid)[:8])
@@ -908,7 +882,7 @@ class ProcessScheduler:
 
                 self.event_bus.publish(
                     Event(
-                        event_type="STEP_SUCCEEDED",
+                        type=EventType.STEP_SUCCEEDED,
                         pid=pid,
                         step_id=step_id,
                     )
@@ -930,7 +904,7 @@ class ProcessScheduler:
                     step.status = StepStatus.SKIPPED
                     self.event_bus.publish(
                         Event(
-                            event_type="STEP_SKIPPED",
+                            type=EventType.STEP_SKIPPED,
                             pid=pid,
                             step_id=step_id,
                             metadata={"error": error_msg},
@@ -940,7 +914,7 @@ class ProcessScheduler:
                     step.fail(error_msg)
                     self.event_bus.publish(
                         Event(
-                            event_type="STEP_FAILED",
+                            type=EventType.STEP_FAILED,
                             pid=pid,
                             step_id=step_id,
                             metadata={"error": error_msg},
@@ -975,6 +949,11 @@ class ProcessScheduler:
     async def _handle_heartbeat(self, msg):
         """Handle worker heartbeat messages"""
         data = json.loads(msg.data.decode())
+        
+        # Add trace attributes
+        if TELEMETRY_ENABLED and self.tracer:
+            span = trace.get_current_span()
+            span.set_attribute("worker.id", data.get("worker_id", "unknown")[:8])
 
         worker_id = data["worker_id"]
         
@@ -1046,7 +1025,7 @@ class ProcessScheduler:
                         print(f"[TXN-ERROR] Rollback failed for PID={pid}: {e}")
 
                     self.event_bus.publish(
-                        Event(event_type="PROCESS_FAILED", pid=pid)
+                        Event(type=EventType.PROCESS_FAILED, pid=pid)
                     )
                     
                     print(f"\n[PROCESS] {pid} finalized as FAILED\n")
@@ -1062,7 +1041,7 @@ class ProcessScheduler:
                     self.checkpoint_manager.save_checkpoint(process, steps)
 
                     self.event_bus.publish(
-                        Event(event_type="PROCESS_SUCCEEDED", pid=pid)
+                        Event(type=EventType.PROCESS_COMPLETED, pid=pid)
                     )
 
                     print(f"\n[PROCESS] {pid} finalized as SUCCEEDED\n")
@@ -1119,7 +1098,7 @@ class ProcessScheduler:
 
             self.event_bus.publish(
                 Event(
-                    event_type="STEP_REQUEUED",
+                    type=EventType.STEP_REQUED,
                     pid=pid,
                     step_id=step_id,
                     metadata={"reason": "lease_timeout", "retry": step.retries},
@@ -1173,7 +1152,7 @@ class ProcessScheduler:
         self._active_steps_per_process.pop(pid, None)
 
         self.event_bus.publish(
-            Event(event_type="PROCESS_CANCELLED", pid=pid)
+            Event(type=EventType.PROCESS_CANCELLED, pid=pid)
         )
 
         return True
@@ -1194,7 +1173,7 @@ class ProcessScheduler:
         self.repo.save_process(process)
 
         self.event_bus.publish(
-            Event(event_type="PROCESS_PAUSED", pid=pid)
+            Event(type=EventType.PROCESS_PAUSED, pid=pid)
         )
 
         print(f"[PAUSE] Process {pid} paused")
@@ -1216,7 +1195,7 @@ class ProcessScheduler:
         self.repo.save_process(process)
 
         self.event_bus.publish(
-            Event(event_type="PROCESS_RESUMED", pid=pid)
+            Event(type=EventType.PROCESS_RESUMED, pid=pid)
         )
 
         print(f"[RESUME] Process {pid} resumed")
@@ -1234,7 +1213,7 @@ class ProcessScheduler:
 
             self.event_bus.publish(
                 Event(
-                    event_type="STEP_DEAD",
+                    type=EventType.STEP_DEAD,
                     pid=process.pid,
                     step_id=step.step_id,
                     metadata={"reason": reason},
@@ -1254,7 +1233,7 @@ class ProcessScheduler:
 
         self.event_bus.publish(
             Event(
-                event_type="STEP_RETRY_SCHEDULED",
+                type=EventType.STEP_RETRY_SCHEDULED,
                 pid=process.pid,
                 step_id=step.step_id,
                 metadata={"retry": step.retries, "backoff": backoff},
@@ -1319,7 +1298,7 @@ class ProcessScheduler:
             self.repo.save_step(step)
             self.event_bus.publish(
                 Event(
-                    event_type="STEP_FAILED",
+                    type=EventType.STEP_FAILED,
                     pid=process.pid,
                     step_id=step.step_id,
                     metadata={"reason": "security_policy"},
@@ -1414,8 +1393,8 @@ class ProcessScheduler:
         """Acquire a worker for a step with load balancing"""
         
         if TELEMETRY_ENABLED and self.tracer:
-            span = self.tracer.start_span("worker.acquire")
-            span.set_attribute("step.syscall", step_syscall)
+            with self.tracer.start_as_current_span("worker.acquire") as span:
+                span.set_attribute("step.syscall", step_syscall)
         else:
             span = None
         

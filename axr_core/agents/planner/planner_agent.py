@@ -2,216 +2,283 @@
 import json
 import logging
 from typing import Dict, List, Optional, Any
+from axr_core.agents.base.agent import BaseAgent, TaskContext, ExecutionContext
 from axr_core.agents.llm_client import LLMClient
 from tool_registry.registry import tool_registry
 from axr_core.telemetry.custom import trace_agent_decision
 
 logger = logging.getLogger(__name__)
 
-class PlannerAgent:
-    """
-    Planner agent that uses CodeLlama to create intelligent plans
-    """
+class PlannerAgent(BaseAgent):
+    name = "planner_agent"
+    domain = "planning"
+    task_types = []  # Add appropriate task types
+    capabilities = ["task_planning", "workflow_optimization", "replanning"]
+    rating = 4.8
+    cost_per_run = 0.003
+    avg_latency = 150
     
-    # This is the key - teaching the LLM what format to use!
-    SYSTEM_PROMPT = """You are an expert workflow planner for a distributed task execution system.
+    def __init__(self, llm_client: LLMClient = None):
+        super().__init__()
+        # Initialize LLM client if not provided
+        if llm_client is None:
+            from axr_core.agents.llm_client import LLMClient
+            self.llm = LLMClient()
+        else:
+            self.llm = llm_client
+        self.active_plans = {}  # Track active plans per process
+    
+    
 
+    async def execute(self, task: Dict, context: Optional[TaskContext] = None) -> Dict:
+        """Execute planning task - fixed signature"""
+        goal = task.get("goal")
+        
+        if task.get("action") == "replan":
+            failed_step = task.get("failed_step")
+            error = task.get("error")
+            return await self._replan_after_failure(failed_step, error, context)
+        else:
+            return await self.create_plan(goal, context)
+      
+        
+    async def can_handle_step(self, step: Dict, context: ExecutionContext) -> bool:
+        """Planner can handle any step that needs replanning"""
+        # Planner can handle steps that are marked for replanning or any step if no domain agent exists
+        return step.get("needs_replanning", False) or step.get("tool") in ["planning", "replan"]
+    
+    async def on_step_failed(self, failed_step: Dict, error: str, context: ExecutionContext) -> List[Dict]:
+        """Handle step failure by creating alternative plan"""
+        logger.info(f"🔄 Planner handling failure: {failed_step.get('tool', 'unknown')} - {error}")
+        
+        # Try to find a domain agent first
+        domain_agent = await self._get_domain_agent_for_step(failed_step, context)
+        
+        if domain_agent and hasattr(domain_agent, 'can_handle_step') and await domain_agent.can_handle_step(failed_step, context):
+            # Let domain agent handle it first
+            return await domain_agent.on_step_failed(failed_step, error, context)
+        
+        # If no domain agent can handle, create alternative plan
+        return await self._create_alternative_plan(failed_step, error, context)
+    
+    async def optimize_plan(self, original_plan: List[Dict], context: ExecutionContext) -> List[Dict]:
+        """Optimize the entire plan using LLM"""
+        if not original_plan:
+            return original_plan
+            
+        system_prompt = """You are an expert workflow optimizer. Optimize the given plan for:
+1. Parallel execution opportunities
+2. Dependency optimization
+3. Resource utilization
+4. Failure recovery paths
+
+Return optimized plan with same structure."""
+        
+        try:
+            plan_json = json.dumps({"steps": original_plan}, indent=2)
+            prompt = f"Optimize this plan:\n{plan_json}\nGoal: {context.goal}"
+            
+            optimized = self.llm.generate_json(prompt, system_prompt)
+            return optimized.get("steps", original_plan)
+        except Exception as e:
+            logger.warning(f"Plan optimization failed: {e}, using original")
+            return original_plan
+    
+    async def suggest_parallelization(self, steps: List[Dict], context: ExecutionContext) -> List[List[int]]:
+        """Suggest which steps can run in parallel based on priorities"""
+        if not steps:
+            return []
+            
+        # Group steps by priority
+        priority_groups = {}
+        for i, step in enumerate(steps):
+            priority = step.get("priority", 1)
+            if priority not in priority_groups:
+                priority_groups[priority] = []
+            priority_groups[priority].append(i)
+        
+        # Return groups that can run in parallel
+        return list(priority_groups.values())
+    
+    @trace_agent_decision("planner")
+    async def create_plan(self, goal: str, context: ExecutionContext = None) -> Dict:
+        """Create initial plan"""
+        try:
+            # Get tool descriptions
+            tools = tool_registry.list_tools()
+            tool_descriptions = "\n".join([
+                f"- {t.syscall}: {t.description}" for t in tools
+            ])
+            
+            system_prompt = f"""You are an expert workflow planner.
 AVAILABLE TOOLS:
 {tool_descriptions}
 
-IMPORTANT RULES:
-1. You must ONLY use tools from the available tools list above
-2. You must return ONLY valid JSON in the exact format shown below
-3. Steps with the SAME priority can run in PARALLEL
-4. Steps with HIGHER priority numbers run AFTER lower priority steps
-5. A step can only run after ALL its dependencies are complete
+Create a plan with steps that can be dynamically adjusted during execution.
+Consider alternative approaches for each step.
 
-RESPONSE FORMAT - YOU MUST RETURN EXACTLY THIS STRUCTURE:
-{
+RESPONSE FORMAT:
+{{
     "steps": [
-        {
-            "tool": "tool.name",  # Must be from available tools
-            "priority": 1,        # Lower number = runs first
-            "depends_on": []      # List of step indices (0-based) this step depends on
-        }
+        {{
+            "tool": "tool.name",
+            "priority": 1,
+            "params": {{}}
+        }}
     ]
-}
+}}"""
 
-EXAMPLES:
-
-Example 1: "clone repo and scan it"
-{
-    "steps": [
-        {"tool": "git.clone", "priority": 1, "depends_on": []},
-        {"tool": "sast.scan", "priority": 2, "depends_on": [0]}
-    ]
-}
-
-Example 2: "deploy after tests"
-{
-    "steps": [
-        {"tool": "git.clone", "priority": 1, "depends_on": []},
-        {"tool": "test.run", "priority": 2, "depends_on": [0]},
-        {"tool": "deploy.service", "priority": 3, "depends_on": [1]}
-    ]
-}
-
-Example 3: "security scan and lint in parallel, then deploy"
-{
-    "steps": [
-        {"tool": "git.clone", "priority": 1, "depends_on": []},
-        {"tool": "sast.scan", "priority": 2, "depends_on": [0]},
-        {"tool": "lint", "priority": 2, "depends_on": [0]},
-        {"tool": "deploy.service", "priority": 3, "depends_on": [1, 2]}
-    ]
-}
-
-Remember: Return ONLY the JSON object, no explanations or markdown.
-"""
-
-    def __init__(self, llm_client: LLMClient):
-        self.llm = llm_client
-
-    
-    @trace_agent_decision("planner")
-    def create_plan(self, goal: str) -> Dict:
-        """Create a plan using CodeLlama"""
-        
-        # Get tool descriptions
-        tools = tool_registry.list_tools()
-        tool_descriptions = "\n".join([
-            f"- {t.name}: {t.description}" for t in tools
-        ])
-        
-        # Fill in the system prompt with actual tools
-        system_prompt = self.SYSTEM_PROMPT.replace("{tool_descriptions}", tool_descriptions)
-        
-        # Create the user prompt
-        user_prompt = f"""User goal: {goal}
-
-Create an optimized execution plan with proper dependencies.
-Use only the available tools listed above.
-Think about what steps are needed and their logical order.
-
-Remember: Return ONLY the JSON object with steps array."""
-
-        try:
-            logger.info(f"🤖 Asking CodeLlama to plan: {goal}")
-            logger.debug(f"System prompt: {system_prompt}")
-            logger.debug(f"User prompt: {user_prompt}")
+            prompt = f"Create an execution plan for: {goal}"
             
-            plan = self.llm.generate_json(user_prompt, system_prompt)
-            logger.info(f"✅ CodeLlama generated plan: {json.dumps(plan, indent=2)}")
+            plan = self.llm.generate_json(prompt, system_prompt)
             
-            # Validate and fix the plan
-            validated_plan = self._validate_plan(plan)
-            return validated_plan
+            # Validate plan has steps
+            if "steps" not in plan:
+                plan = {"steps": []}
+            
+            # Store plan for this process
+            if context and hasattr(context, 'process_id'):
+                self.active_plans[context.process_id] = plan
+            
+            return plan
             
         except Exception as e:
-            logger.error(f"❌ CodeLlama failed: {e}")
-            import traceback
-            traceback.print_exc()
-            logger.info("📋 Using fallback plan")
+            logger.error(f"Plan creation failed: {e}, using fallback")
             return self._fallback_plan(goal)
+    
+    async def _replan_after_failure(self, failed_step: Dict, error: str, context: ExecutionContext) -> Dict:
+        """Create new plan segment after failure"""
+        system_prompt = """The current step failed. Create alternative steps to achieve the same goal.
+Consider:
+1. Different tools that can do the same job
+2. Breaking the step into smaller substeps
+3. Skipping if optional
+4. Using fallback methods
 
-    def _validate_plan(self, plan: Dict) -> Dict:
-        """Ensure plan has required structure and uses valid tools"""
-        if "steps" not in plan:
-            plan["steps"] = []
+Return ONLY a JSON object with 'steps' array."""
         
-        # Get available tool names for validation
-        available_tools = [t.name for t in tool_registry.list_tools()]
+        try:
+            prompt = f"""Failed step: {json.dumps(failed_step)}
+Error: {error}
+Goal: {context.goal if context else 'unknown'}
+Completed steps: {len(context.step_results) if context else 0}
+Create replacement steps:"""
+            
+            return self.llm.generate_json(prompt, system_prompt)
+        except:
+            return {"steps": []}
+    
+    async def _create_alternative_plan(self, failed_step: Dict, error: str, context: ExecutionContext) -> List[Dict]:
+        """Create alternative steps for the failed one"""
+        # Simple fallback: try different tool based on error type
+        tool_name = failed_step.get("tool", "")
         
-        valid_steps = []
-        for i, step in enumerate(plan["steps"]):
-            # Check if step has required fields
-            if "tool" not in step:
-                logger.warning(f"Step {i} missing 'tool', skipping")
-                continue
-            
-            # Check if tool is available
-            if step["tool"] not in available_tools:
-                logger.warning(f"Tool '{step['tool']}' not available, using git.clone")
-                step["tool"] = "git.clone"
-            
-            # Ensure priority exists
-            if "priority" not in step:
-                step["priority"] = 1
-            
-            # Ensure depends_on exists
-            if "depends_on" not in step:
-                step["depends_on"] = []
-            
-            # Validate dependencies are valid indices
-            valid_deps = []
-            for dep in step["depends_on"]:
-                if isinstance(dep, int) and 0 <= dep < i:
-                    valid_deps.append(dep)
-                elif isinstance(dep, str) and dep.isdigit():
-                    dep_int = int(dep)
-                    if 0 <= dep_int < i:
-                        valid_deps.append(dep_int)
-            
-            step["depends_on"] = valid_deps
-            valid_steps.append(step)
+        # Common tool alternatives
+        alternatives = {
+            "git.clone": [
+                {"tool": "git.clone_ssh", "priority": failed_step.get("priority", 1), 
+                 "params": {"fallback": True, "original": tool_name}}
+            ],
+            "sast.scan": [
+                {"tool": "sast.scan_light", "priority": failed_step.get("priority", 1),
+                 "params": {"mode": "quick", "original": tool_name}}
+            ],
+            "test.run": [
+                {"tool": "test.run_quick", "priority": failed_step.get("priority", 1),
+                 "params": {"parallel": True, "original": tool_name}}
+            ],
+        }
         
-        plan["steps"] = valid_steps
-        return plan
-
-    @trace_agent_decision("planner")
+        if tool_name in alternatives:
+            return alternatives[tool_name]
+        
+        # Default: return a logging step
+        return [{
+            "tool": "log.error",
+            "priority": failed_step.get("priority", 1),
+            "params": {
+                "message": f"Cannot recover from {tool_name} failure: {error}",
+                "original_tool": tool_name
+            }
+        }]
+    
+    async def _get_domain_agent_for_step(self, step: Dict, context: ExecutionContext):
+        """Find appropriate domain agent for a step"""
+        # This would use your agent registry to find agents by domain
+        from axr_core.agents.registry.agent_registry import agent_registry
+        
+        # Try to infer domain from tool name
+        tool = step.get("tool", "")
+        domain_map = {
+            "git.": "vcs",
+            "sast.": "security",
+            "test.": "testing",
+            "deploy.": "deployment",
+            "docker.": "container",
+        }
+        
+        domain = "general"
+        for prefix, d in domain_map.items():
+            if tool.startswith(prefix):
+                domain = d
+                break
+        
+        agents = agent_registry.get_agents_by_domain(domain)
+        
+        for agent in agents:
+            if hasattr(agent, 'can_handle_step'):
+                if await agent.can_handle_step(step, context):
+                    return agent
+        
+        return None
+    
     def _fallback_plan(self, goal: str) -> Dict:
         """Simple fallback plan when LLM fails"""
-        # Your existing fallback logic...
         goal_lower = goal.lower()
         steps = []
         
-        # Clone step
-        if any(word in goal_lower for word in ['clone', 'repo', 'git']):
-            steps.append({"tool": "git.clone", "priority": 1, "depends_on": []})
-            clone_idx = 0
-        else:
-            clone_idx = -1
-            steps.append({"tool": "git.clone", "priority": 1, "depends_on": []})
-            clone_idx = 0
+        # Always add a clone step
+        steps.append({"tool": "git.clone", "priority": 1, "params": {}})
+        clone_idx = 0
         
         # Security scan
         if any(word in goal_lower for word in ['scan', 'security', 'sast']):
-            deps = [clone_idx] if clone_idx >= 0 else []
-            steps.append({"tool": "sast.scan", "priority": 2, "depends_on": deps})
-            scan_idx = len(steps) - 1
-        else:
-            scan_idx = -1
+            steps.append({
+                "tool": "sast.scan", 
+                "priority": 2, 
+                "params": {"deps": [clone_idx]}
+            })
         
         # Lint
         if any(word in goal_lower for word in ['lint', 'style']):
-            deps = [clone_idx] if clone_idx >= 0 else []
-            steps.append({"tool": "lint", "priority": 2, "depends_on": deps})
-            lint_idx = len(steps) - 1
-        else:
-            lint_idx = -1
+            steps.append({
+                "tool": "lint", 
+                "priority": 2, 
+                "params": {"deps": [clone_idx]}
+            })
         
         # Build
         if any(word in goal_lower for word in ['build', 'compile']):
-            deps = [clone_idx] if clone_idx >= 0 else []
-            steps.append({"tool": "build", "priority": 2, "depends_on": deps})
-            build_idx = len(steps) - 1
-        else:
-            build_idx = -1
+            steps.append({
+                "tool": "build", 
+                "priority": 2, 
+                "params": {"deps": [clone_idx]}
+            })
         
         # Test
         if any(word in goal_lower for word in ['test']):
-            deps = [build_idx] if build_idx >= 0 else ([clone_idx] if clone_idx >= 0 else [])
-            steps.append({"tool": "test.run", "priority": 3, "depends_on": deps})
+            steps.append({
+                "tool": "test.run", 
+                "priority": 3, 
+                "params": {}
+            })
         
         # Deploy
         if any(word in goal_lower for word in ['deploy', 'staging', 'production']):
-            deps = []
-            if scan_idx >= 0:
-                deps.append(scan_idx)
-            if lint_idx >= 0:
-                deps.append(lint_idx)
-            if build_idx >= 0:
-                deps.append(build_idx)
-            steps.append({"tool": "deploy.service", "priority": 4, "depends_on": deps})
+            steps.append({
+                "tool": "deploy.service", 
+                "priority": 4, 
+                "params": {}
+            })
         
         return {"steps": steps}

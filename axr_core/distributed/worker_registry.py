@@ -81,7 +81,38 @@ class WorkerRegistry:
             if load is not None:
                 self._workers[worker_id]["running"] = load
 
-    # ---- Everything below unchanged ----
+    def get_workers_for_tool(self, tool: str) -> List[str]:
+        """
+        Get all live workers that support a specific tool.
+        Returns list of worker IDs.
+        """
+        with self._lock:
+            now = time.time()
+            workers = []
+            
+            # Get all workers that have this tool registered
+            for worker_id in self._tools_to_workers.get(tool, set()):
+                data = self._workers.get(worker_id)
+                if not data:
+                    continue
+                
+                # Check if worker is still alive
+                if now - data["last_seen"] > self.ttl:
+                    continue
+                
+                workers.append(worker_id)
+            
+            return workers
+
+    def get_worker_tools(self, worker_id: str) -> List[str]:
+        """
+        Get tools supported by a specific worker.
+        """
+        with self._lock:
+            data = self._workers.get(worker_id)
+            if not data:
+                return []
+            return data.get("tools", [])
 
     def get_live_workers(self) -> Dict[str, Dict]:
         now = time.time()
@@ -96,17 +127,7 @@ class WorkerRegistry:
                 if data["tools"] and now - data["last_seen"] <= self.ttl
             }
 
-    def get_workers_for_tool(self, tool: str) -> List[str]:
-        with self._lock:
-            now = time.time()
-            return [
-                wid
-                for wid in self._tools_to_workers.get(tool, set())
-                if wid in self._workers
-                and now - self._workers[wid]["last_seen"] <= self.ttl
-            ]
-
-    def acquire_worker(self, tool: str) -> Optional[str]:
+    def acquire_worker(self, tool: str, preferred: Optional[str] = None) -> Optional[str]:
         with self._lock:
             now = time.time()
             eligible = []
@@ -123,6 +144,14 @@ class WorkerRegistry:
             if not eligible:
                 return None
 
+            # ---- Preferred worker support (for hybrid scheduler) ----
+            if preferred:
+                for wid, load in eligible:
+                    if wid == preferred:
+                        self._workers[wid]["running"] += 1
+                        return wid
+
+            # ---- Default behavior (static scheduler compatibility) ----
             eligible.sort(key=lambda x: x[1])
             worker_id = eligible[0][0]
             self._workers[worker_id]["running"] += 1

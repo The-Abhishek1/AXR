@@ -3,7 +3,7 @@
 import os
 import functools
 import time
-from typing import Callable
+from typing import Callable, Optional, Dict, Any
 
 from opentelemetry import trace
 from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
@@ -12,15 +12,13 @@ from opentelemetry.sdk.trace.export import BatchSpanProcessor
 from opentelemetry.sdk.resources import SERVICE_NAME, Resource
 from opentelemetry.trace import SpanKind, StatusCode
 from opentelemetry.propagate import inject, extract
-import functools
+from opentelemetry.trace.propagation.tracecontext import TraceContextTextMapPropagator
 
 # Simple flag to enable/disable telemetry
 ENABLED = os.getenv("OTEL_ENABLED", "false").lower() == "true"
 
 # Global tracer
 _tracer = None
-
-from opentelemetry.sdk.trace import TracerProvider
 
 def setup_telemetry(service_name: str = "axr-scheduler"):
     global _tracer
@@ -29,9 +27,11 @@ def setup_telemetry(service_name: str = "axr-scheduler"):
         print("🔍 Telemetry disabled")
         return None
 
-    # 🔥 Prevent override
-    if isinstance(trace.get_tracer_provider(), TracerProvider):
+    # Check if already initialized
+    current_provider = trace.get_tracer_provider()
+    if isinstance(current_provider, TracerProvider):
         _tracer = trace.get_tracer(service_name)
+        print(f"🔍 Using existing tracer for {service_name}")
         return _tracer
 
     resource = Resource(attributes={
@@ -57,120 +57,222 @@ def get_tracer(name: str):
     """Get a tracer"""
     return trace.get_tracer(name)
 
-# ==================== SIMPLE DECORATORS ====================
+# ==================== DECORATORS ====================
 
 def trace_step(func: Callable) -> Callable:
-    """Simplest possible step tracer"""
+    """Trace step execution (sync) - FIXED argument order"""
     @functools.wraps(func)
-    def wrapper(process, step, *args, **kwargs):
-        # Execute the function
-        result = func(process, step, *args, **kwargs)
+    def wrapper(first_arg, second_arg, *args, **kwargs):
+        # Determine which is which based on attributes
+        if hasattr(first_arg, 'pid') and hasattr(first_arg, 'intent'):
+            process = first_arg
+            step = second_arg
+        else:
+            step = first_arg
+            process = second_arg
         
-        # Create a span if enabled
-        if ENABLED and _tracer:
+        if not ENABLED or not _tracer:
+            return func(first_arg, second_arg, *args, **kwargs)
+        
+        start_time = time.time()
+        with _tracer.start_as_current_span(
+            name=f"step.execute.{step.syscall}",
+            kind=SpanKind.INTERNAL,
+            attributes={
+                "process.id": str(process.pid),
+                "step.id": str(step.step_id),
+                "step.syscall": step.syscall,
+                "step.priority": step.priority,
+                "process.intent": process.intent[:100] if process.intent else "",
+            }
+        ) as span:
             try:
-                with _tracer.start_as_current_span(
-                    name=f"execute.{step.syscall}",
-                    attributes={
-                        "process.id": str(process.pid)[:8],
-                        "step.id": str(step.step_id)[:8],
-                        "step.syscall": step.syscall,
-                    }
-                ):
-                    # Just creating the span, no need to do anything else
-                    pass
-            except Exception:
-                pass
-        
-        return result
+                result = func(first_arg, second_arg, *args, **kwargs)
+                duration = (time.time() - start_time) * 1000
+                span.set_attribute("step.duration_ms", duration)
+                span.set_status(StatusCode.OK)
+                return result
+            except Exception as e:
+                span.record_exception(e)
+                span.set_attribute("error.message", str(e))
+                span.set_status(StatusCode.ERROR)
+                raise
     return wrapper
 
 def trace_async_step(func: Callable) -> Callable:
-    """Simplest possible async step tracer"""
+    """Trace async step execution (supports class methods)"""
+
     @functools.wraps(func)
-    async def wrapper(process, step, *args, **kwargs):
-        # Execute the function
-        result = await func(process, step, *args, **kwargs)
-        
-        # Create a span if enabled
-        if ENABLED and _tracer:
+    async def wrapper(*args, **kwargs):
+
+        if not ENABLED or not _tracer:
+            return await func(*args, **kwargs)
+
+        # Detect arguments
+        process = None
+        step = None
+
+        for arg in args:
+            if hasattr(arg, "step_id") and hasattr(arg, "syscall"):
+                step = arg
+            elif hasattr(arg, "pid") and hasattr(arg, "intent"):
+                process = arg
+
+        # Fallback safety
+        if not process or not step:
+            return await func(*args, **kwargs)
+
+        start_time = time.time()
+
+        with _tracer.start_as_current_span(
+            name=f"step.execute.{step.syscall}",
+            kind=SpanKind.INTERNAL,
+            attributes={
+                "process.id": str(process.pid),
+                "step.id": str(step.step_id),
+                "step.syscall": step.syscall,
+                "step.priority": step.priority,
+                "process.intent": process.intent[:100] if process.intent else "",
+            },
+        ) as span:
+
             try:
-                with _tracer.start_as_current_span(
-                    name=f"execute.{step.syscall}",
-                    attributes={
-                        "process.id": str(process.pid)[:8],
-                        "step.id": str(step.step_id)[:8],
-                        "step.syscall": step.syscall,
-                    }
-                ):
-                    pass
-            except Exception:
-                pass
-        
-        return result
+                result = await func(*args, **kwargs)
+
+                duration = (time.time() - start_time) * 1000
+                span.set_attribute("step.duration_ms", duration)
+                span.set_status(StatusCode.OK)
+
+                return result
+
+            except Exception as e:
+                span.record_exception(e)
+                span.set_attribute("error.message", str(e))
+                span.set_status(StatusCode.ERROR)
+                raise
+
     return wrapper
 
 def trace_nats_message(func: Callable) -> Callable:
-    """Simplest possible NATS tracer"""
+    """Trace NATS message handling"""
     @functools.wraps(func)
     async def wrapper(msg, *args, **kwargs):
-        # Execute the function
-        result = await func(msg, *args, **kwargs)
+        if not ENABLED or not _tracer:
+            return await func(msg, *args, **kwargs)
         
-        # Create a span if enabled
-        if ENABLED and _tracer:
+        # Extract context from headers
+        headers = getattr(msg, 'headers', {})
+        ctx = TraceContextTextMapPropagator().extract(headers)
+        
+        subject = getattr(msg, 'subject', 'unknown')
+        
+        with _tracer.start_as_current_span(
+            name=f"nats.{subject}",
+            context=ctx,
+            kind=SpanKind.CONSUMER,
+            attributes={
+                "messaging.system": "nats",
+                "messaging.destination": subject,
+                "messaging.message_id": getattr(msg, 'reply', ''),
+            }
+        ) as span:
             try:
-                subject = getattr(msg, 'subject', 'axr')
-                with _tracer.start_as_current_span(
-                    name=f"nats.{subject}",
-                    attributes={
-                        "subject": subject,
-                    }
-                ):
-                    pass
-            except Exception:
-                pass
-        
-        return result
+                # Try to extract message data for attributes
+                if hasattr(msg, 'data') and msg.data:
+                    try:
+                        import json
+                        data = json.loads(msg.data.decode())
+                        if 'step_id' in data:
+                            span.set_attribute("step.id", str(data['step_id'])[:8])
+                        if 'pid' in data:
+                            span.set_attribute("process.id", str(data['pid'])[:8])
+                        if 'status' in data:
+                            span.set_attribute("message.status", data['status'])
+                    except:
+                        pass
+                
+                result = await func(msg, *args, **kwargs)
+                span.set_status(StatusCode.OK)
+                return result
+            except Exception as e:
+                span.record_exception(e)
+                span.set_attribute("error.message", str(e))
+                span.set_status(StatusCode.ERROR)
+                raise
     return wrapper
 
 def trace_agent_decision(agent_name: str):
-    """Simplest possible agent decision tracer"""
+    """Trace agent decision making"""
     def decorator(func: Callable) -> Callable:
         @functools.wraps(func)
         def wrapper(*args, **kwargs):
-            # Execute the function
-            result = func(*args, **kwargs)
+            if not ENABLED or not _tracer:
+                return func(*args, **kwargs)
             
-            # Create a span if enabled
-            if ENABLED and _tracer:
+            start_time = time.time()
+            with _tracer.start_as_current_span(
+                name="agent.decision",
+                kind=SpanKind.INTERNAL,
+                attributes={
+                    "agent.name": agent_name,
+                }
+            ) as span:
                 try:
-                    with _tracer.start_as_current_span(
-                        name="agent.decision",
-                        attributes={
-                            "agent.name": agent_name,
-                        }
-                    ):
-                        pass
-                except Exception:
-                    pass
-            
-            return result
+                    result = func(*args, **kwargs)
+                    duration = (time.time() - start_time) * 1000
+                    span.set_attribute("decision.duration_ms", duration)
+                    if isinstance(result, dict):
+                        span.set_attribute("decision.steps", len(result.get('steps', [])))
+                    span.set_status(StatusCode.OK)
+                    return result
+                except Exception as e:
+                    span.record_exception(e)
+                    span.set_attribute("error.message", str(e))
+                    span.set_status(StatusCode.ERROR)
+                    raise
         return wrapper
     return decorator
 
+def trace_scheduler_cycle(func: Callable) -> Callable:
+    """Trace scheduler cycle"""
+    @functools.wraps(func)
+    async def wrapper(self, *args, **kwargs):
+        if not ENABLED or not _tracer:
+            return await func(self, *args, **kwargs)
+        
+        start_time = time.time()
+        with _tracer.start_as_current_span(
+            name="scheduler.cycle",
+            kind=SpanKind.INTERNAL,
+            attributes={
+                "global.active_steps": getattr(self, '_global_active_steps', 0),
+                "processes.total": len(getattr(self, 'processes', {})),
+            }
+        ) as span:
+            try:
+                result = await func(self, *args, **kwargs)
+                duration = (time.time() - start_time) * 1000
+                span.set_attribute("cycle.duration_ms", duration)
+                span.set_status(StatusCode.OK)
+                return result
+            except Exception as e:
+                span.record_exception(e)
+                span.set_attribute("error.message", str(e))
+                span.set_status(StatusCode.ERROR)
+                raise
+    return wrapper
 
-def trace_with_context(func):
-    """Decorator that preserves trace context across async boundaries"""
+def trace_with_context(func: Callable) -> Callable:
+    """Preserve trace context across async boundaries"""
     @functools.wraps(func)
     async def wrapper(*args, **kwargs):
-        # Get current span context
+        if not ENABLED or not _tracer:
+            return await func(*args, **kwargs)
+        
         current_span = trace.get_current_span()
         ctx = trace.set_span_in_context(current_span)
         
-        # Create a new span as child of current context
-        tracer = trace.get_tracer(__name__)
-        with tracer.start_as_current_span(
+        with _tracer.start_as_current_span(
             name=func.__name__,
             context=ctx,
             kind=SpanKind.INTERNAL
@@ -181,17 +283,18 @@ def trace_with_context(func):
                 return result
             except Exception as e:
                 span.record_exception(e)
-                span.set_status(StatusCode.ERROR, str(e))
+                span.set_attribute("error.message", str(e))
+                span.set_status(StatusCode.ERROR)
                 raise
     return wrapper
 
 def inject_trace_headers(headers: dict = None) -> dict:
-    """Inject trace context into headers for NATS messages"""
+    """Inject trace context into headers"""
     if headers is None:
         headers = {}
-    inject(headers)
+    TraceContextTextMapPropagator().inject(headers)
     return headers
 
 def extract_trace_from_headers(headers: dict):
     """Extract trace context from headers"""
-    return extract(headers)
+    return TraceContextTextMapPropagator().extract(headers)

@@ -1,35 +1,63 @@
-# Security policies for AXR execution runtime
-# This file controls what syscalls are allowed, denied, and their budget limits
 
 allowed_syscalls:
-  # Version Control
-  - git.clone           # Clone git repositories
-  
-                          # Security Scanning
-  - sast.scan          # Static application security testing
-  - dependency.check    # Check for vulnerable dependencies
-  
-  # Code Quality
-  - lint                # Lint source code for style issues
-  
-  # Build & Test
-  - build               # Build application artifacts
-  - test.run            # Run unit/integration tests
-  
-  # Deployment
-  - deploy.service      # Deploy to environments
+  # Actual tool names from your registry
+  - git.clone
+  - sast.scan
+  - dependency.check
+  - lint
+  - build
+  - test.run
+  - test.clone
+  - deploy.service
+  - docker.build
+  - security_scan
+  - vulnerability_scan
+  - code_scan
+  - scan
+  - report_generation
+  - generate_report
+  - send_email
+  - email
+  - notify
+  - summarize
+  - text_summary
+
+  # Generic normalized names
+  - scan
+  - security_scan
+  - git
+  - git_clone
+  - test
+  - test_run
+  - build
+  - deploy
+  - email
+  - send_email
+  - report
+  - report_generation
+  - dependency
+  - dependency_check
+  - lint
+
+  # LLM-generated names (let LLM decide)
+  - SCAN Tool
+  - Git Tool
+  - Test Tool
+  - security_scan
+  - vulnerability_scan
+  - code_scan
+  - report_generation
+  - send_email
+  - notify
 
 denied_syscalls:
   # Explicitly deny dangerous operations
   - git.push            # Prevent unauthorized pushes
   - rm -rf              # Prevent destructive file operations
   - sudo                # Prevent privilege escalation
-  - chmod 777          # Prevent permission changes
+  - chmod 777           # Prevent permission changes
   - curl external       # Block unauthorized external calls (use tools instead)
-  
-  # Potentially dangerous tools (uncomment if needed)
-  # - docker.run         # Container execution (enable with caution)
-  # - kubectl.delete     # Kubernetes deletion (admin only)
+
 
 budget_limits:
   max_per_process: 100  # Maximum budget units per process

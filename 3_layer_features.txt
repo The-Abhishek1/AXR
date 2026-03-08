@@ -1,0 +1,248 @@
+🏗️ The Three AXR Execution Layers
+Think of them as different "driving modes" for your autonomous system:
+
+text
+                    ┌─────────────────────────────────────┐
+                    │         AXR Execution Layers        │
+├──────────────────┼───────────────────┼──────────────────┤
+│    STATIC        │    ENHANCED        │    HYBRID        │
+│    (Basic)       │    (Smart)         │    (Enterprise)  │
+└──────────────────┴───────────────────┴──────────────────┘
+1️⃣ STATIC SCHEDULER (/tasks) - "The Reliable Workhorse"
+What it is:
+The original, battle-tested scheduler that follows rigid, pre-defined workflows.
+
+Capabilities:
+✅ Fixed DAG execution
+
+✅ Worker-based distribution
+
+✅ Security policies
+
+✅ Budget tracking
+
+✅ Basic retry logic
+
+✅ Process persistence
+
+When to Use:
+bash
+# Simple, predictable workflows
+curl -X POST http://localhost:8000/tasks \
+  -H "Content-Type: application/json" \
+  -d '{"goal": "Clone repo and run tests"}'
+
+# CI/CD pipelines
+curl -X POST http://localhost:8000/tasks \
+  -H "Content-Type: application/json" \
+  -d '{"goal": "Build, test, deploy"}'
+Best For:
+🔹 CI/CD pipelines
+
+🔹 Batch processing
+
+🔹 Scheduled jobs
+
+🔹 When you need predictability
+
+2️⃣ ENHANCED SCHEDULER (/enhanced/execute) - "The Smart Collaborator"
+What it is:
+Agent-based execution where AI agents collaborate, learn, and adapt.
+
+Capabilities:
+✅ Multi-agent collaboration
+
+✅ Dynamic planning
+
+✅ Learning from failures
+
+✅ Tool creation on-demand
+
+✅ Agent memory
+
+✅ Natural language goals
+
+When to Use:
+bash
+# Complex goals requiring multiple agents
+curl -X POST http://localhost:8000/enhanced/execute \
+  -H "Content-Type: application/json" \
+  -d '{
+    "goal": "Scan code, fix vulnerabilities, and deploy"
+  }'
+
+# Tasks needing AI reasoning
+curl -X POST http://localhost:8000/enhanced/execute \
+  -H "Content-Type: application/json" \
+  -d '{
+    "goal": "Analyze logs, find issues, and send report"
+  }'
+Best For:
+🔹 Complex problem-solving
+
+🔹 Tasks needing multiple domains
+
+🔹 When you want AI assistance
+
+🔹 Exploratory workflows
+
+3️⃣ HYBRID SCHEDULER (/hybrid/execute) - "The Enterprise Beast"
+What it is:
+The best of both worlds - enterprise features + agent intelligence.
+
+Capabilities:
+✅ All STATIC features (workers, NATS, security, quotas)
+
+✅ All ENHANCED features (agents, learning, collaboration)
+
+✅ PLUS:
+
+Priority queues & backpressure
+
+Advanced retry with exponential backoff
+
+Heap-based scheduling
+
+Event-driven architecture
+
+Lease management
+
+Auto-scaling with cooldown
+
+Metrics collection
+
+DAG mutation API
+
+Process pause/resume/cancel
+
+Step-level control
+
+When to Use:
+bash
+# Full enterprise with agent intelligence
+curl -X POST http://localhost:8000/hybrid/execute \
+  -H "Content-Type: application/json" \
+  -d '{
+    "goal": "Scan repo, fix issues, build Docker, deploy to prod",
+    "user_id": "team-alpha"
+  }'
+
+# Long-running, complex workflows
+curl -X POST http://localhost:8000/hybrid/execute \
+  -H "Content-Type: application/json" \
+  -d '{
+    "goal": "Migrate database, update schemas, verify data, notify team",
+    "user_id": "db-admin"
+  }'
+
+# Tasks needing manual intervention
+# First execute
+curl -X POST http://localhost:8000/hybrid/execute \
+  -H "Content-Type: application/json" \
+  -d '{"goal": "Security audit"}'
+
+# Then control it
+curl -X POST http://localhost:8000/hybrid/process/control \
+  -H "Content-Type: application/json" \
+  -d '{
+    "process_id": "your-process-id",
+    "action": "pause"
+  }'
+
+# Resume later
+curl -X POST http://localhost:8000/hybrid/process/control \
+  -H "Content-Type: application/json" \
+  -d '{
+    "process_id": "your-process-id",
+    "action": "resume"
+  }'
+Best For:
+🔹 Production workloads
+
+🔹 Multi-step enterprise workflows
+
+🔹 Tasks needing monitoring/intervention
+
+🔹 When you need both reliability AND intelligence
+
+📊 Comparison Table
+Feature	STATIC	ENHANCED	HYBRID
+Worker Distribution	✅	❌	✅
+NATS Communication	✅	❌	✅
+Security Policies	✅	✅	✅
+Budget/Quotas	✅	❌	✅
+Persistence	✅	❌	✅
+Agent Collaboration	❌	✅	✅
+Dynamic Planning	❌	✅	✅
+Learning from Failures	❌	✅	✅
+Tool Creation	❌	✅	✅
+Process Control	❌	❌	✅
+Step Control	❌	❌	✅
+Priority Queues	❌	❌	✅
+Auto-scaling	❌	❌	✅
+Metrics Collection	❌	❌	✅
+DAG Mutation	❌	❌	✅
+Event-Driven	❌	❌	✅
+🎯 Quick Decision Guide
+python
+# Use STATIC when:
+if task["type"] == "simple_workflow" or task["needs_reliability"]:
+    use("/tasks")
+
+# Use ENHANCED when:
+if task["requires_reasoning"] or task["needs_creativity"]:
+    use("/enhanced/execute")
+
+# Use HYBRID when:
+if task["is_production"] or task["needs_control"] or task["is_complex"]:
+    use("/hybrid/execute")
+🚀 Real-World Examples
+Example 1: Daily CI/CD
+bash
+# Static is perfect
+curl -X POST http://localhost:8000/tasks \
+  -d '{"goal": "Run tests and build"}'
+Example 2: Security Incident Response
+bash
+# Enhanced can investigate creatively
+curl -X POST http://localhost:8000/enhanced/execute \
+  -d '{
+    "goal": "Investigate unusual logs, find attack vectors, suggest fixes"
+  }'
+Example 3: Production Deployment
+bash
+# Hybrid gives you control and reliability
+# Start deployment
+curl -X POST http://localhost:8000/hybrid/execute \
+  -d '{
+    "goal": "Canary deploy to 10% of servers, monitor metrics, rollback if errors",
+    "user_id": "prod-team"
+  }'
+
+# Check status
+curl http://localhost:8000/hybrid/process/YOUR_PROCESS_ID
+
+# Pause if issues detected
+curl -X POST http://localhost:8000/hybrid/process/control \
+  -d '{
+    "process_id": "YOUR_PROCESS_ID",
+    "action": "pause"
+  }'
+
+# Resume after investigation
+curl -X POST http://localhost:8000/hybrid/process/control \
+  -d '{
+    "process_id": "YOUR_PROCESS_ID", 
+    "action": "resume"
+  }'
+💡 Pro Tips
+Start with STATIC for simple workflows
+
+Move to ENHANCED when you need AI assistance
+
+Use HYBRID for production systems needing control
+
+All three can run simultaneously - they share workers!
+
+Your AXR system now has the flexibility of a Swiss Army knife - choose the right tool for the job! 🎉
+

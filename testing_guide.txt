@@ -1,0 +1,28 @@
+# AXR Testing Guide
+
+## Quick Start
+
+1. Start the server (in one terminal):
+
+cd ~/AS/AXR
+export AXR_ENV=development
+uvicorn api.app:app --host 0.0.0.0 --reload
+
+2. Run the API test (in another terminal):
+
+cd ~/AS/AXR/tests
+python3 test_http_api.py
+
+3. Run agent system tests:
+
+cd ~/AS/AXR/tests
+python3 test_agent_system.py
+python3 test_mock_execution.py
+
+4. Available Test Scripts
+
+Script	                Description
+test_http_api.py	    Tests all HTTP endpoints
+test_agent_system.py	Tests agent registry and capabilities
+test_mock_execution.py	Tests mock agent execution
+test_api.py             Test agents

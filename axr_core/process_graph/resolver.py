@@ -21,6 +21,10 @@ class ProcessGraphResolver:
     # ------------------------
     # Public API
     # ------------------------
+    
+    def get_runnable_steps(self):
+        """Get steps that are ready to run (alias for resolve)"""
+        return self.resolve()
         
     def resolve(self) -> List[ProcessStep]:
         runnable: List[ProcessStep] = []
@@ -28,7 +32,7 @@ class ProcessGraphResolver:
         for step in self.steps.values():
 
             # Skip finished steps
-            if step.status in {StepStatus.SUCCESS, StepStatus.RUNNING, StepStatus.SKIPPED}:
+            if step.status in {StepStatus.SUCCESS, StepStatus.RUNNING, StepStatus.SKIPPED, StepStatus.DISPATCHED}:
                 continue
 
             # If any dependency failed → skip this step

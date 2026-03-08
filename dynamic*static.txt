@@ -1,0 +1,19 @@
+Comparison:                 Static Scheduler                 vs             Dynamic Scheduler
+
+Feature	            Static Scheduler (scheduler.py)	                    Dynamic Scheduler (dynamic_scheduler.py)
+
+Workers/NATS	    ✅ Full NATS integration with worker registry	   ❌ No worker management
+Checkpointing	    ✅ Full checkpoint manager	                       ❌ No persistence
+Event Bus	        ✅ Complete event system	                           ❌ No events
+Budget Limits	    ✅ Resource manager with budget tracking	           ❌ No budget concept
+Database	        ✅ PostgreSQL persistence	                       ❌ In-memory only
+Priority Scheduling	✅ Advanced scheduler with quotas	               ❌ Simple priority groups
+Security Policies	✅ Security evaluator	                           ❌ No security
+Capability Tokens	✅ Full capability system	                       ❌ No capabilities
+Transaction Manager	✅ Rollback support	                               ❌ No transactions
+Lease Management	✅ Worker leases	                                   ❌ No leases
+Retry Manager	    ✅ Sophisticated retry logic	                       ❌ Simple retry only
+Resource Manager	✅ Full resource tracking	                       ❌ No resource limits
+Process State	    ✅ Persistent process state	                       ❌ In-memory only
+Telemetry	        ✅ OpenTelemetry integration	                       ❌ No telemetry
+Auto-scaling	    ✅ Worker auto-scaler	                           ❌ No scaling

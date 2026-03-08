@@ -1,0 +1,36 @@
+# docker-compose.dev.yml
+version: '3.8'
+
+services:
+  nats:
+    image: nginx/nginx-prometheus-exporter:latest
+    ports:
+      - "4222:4222"
+    command: ["-js"]
+    
+  axr-api:
+    build: 
+      context: .
+      dockerfile: Dockerfile.dev
+    ports:
+      - "8000:8000"
+    environment:
+      - NATS_URL=nats://nats:4222
+      - OLLAMA_URL=http://ollama:11434
+      - MOCK_MODE=true
+      - MAX_CONCURRENT_AGENTS=2
+    volumes:
+      - ./axr_core:/app/axr_core
+      - ./api:/app/api
+    depends_on:
+      - nats
+      
+  ollama:
+    image: ollama/ollama:latest
+    ports:
+      - "11434:11434"
+    volumes:
+      - ./ollama:/root/.ollama
+    command: ["serve"]
+    # Optional: pull tiny model for development
+    # entrypoint: ["/bin/sh", "-c", "ollama serve & sleep 5 && ollama pull tinyllama && wait"]

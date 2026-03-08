@@ -43,3 +43,14 @@ Step 4
 Agent orchestration
 
 Execution Graph Intelligence
+
+
+AXR System
+├── Traditional Path
+│   └── POST /tasks → static_scheduler → workers
+│
+├── Enhanced Path  
+│   └── POST /enhanced/execute → agent_runner → static_scheduler
+│
+└── Hybrid Path (New)
+    └── POST /hybrid/execute → hybrid_scheduler → workers + agents
